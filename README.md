@@ -2,13 +2,18 @@
 
 *"The hundred-eyed giant — nothing escapes him."*
 
-Instant file search for Windows. Reads the NTFS Master File Table directly, no
-background indexer required, no external services. Written in C++20 with a
-native Qt6 GUI.
+**Instant file search for Windows.** Reads the NTFS Master File Table directly —
+no background indexer, no external services. Written in C++20 with a native
+Qt6 GUI.
 
-**Status:** v0.2.0 released — indexes a full NTFS drive (millions of files) in
-seconds and gives you live substring, wildcard or regex search in the GUI. See
-[Releases](../../releases) for a portable Windows zip.
+![Argus indexing 1.5M files across two NTFS volumes](docs/screenshot.png)
+
+**Status:** v0.6.0 released — indexes millions of files across every NTFS
+volume in seconds, then gives you live substring / wildcard / regex / fuzzy
+search, an advanced query syntax (`ext:pdf size:>10MB modified:<7d`), an
+NTFS details panel that surfaces hardlinks and Alternate Data Streams, a
+duplicate finder, and a console CLI. See [Releases](../../releases) for the
+portable Windows zip.
 
 ## Why?
 
@@ -29,17 +34,39 @@ requires elevated privileges).
 
 ## Features
 
+### Search
 - Reads NTFS MFT directly via raw disk IO — no background indexer
-- Live search with three modes: **Text** (substring), **Wildcard** (`*.mp4`),
-  **Regex** (full ECMAScript)
+- **Four search modes**: Text (substring) · Wildcard (`*.mp4`) · Regex (ECMAScript) · **Fuzzy** (fzf-style scoring)
+- **Advanced query syntax** mixes freely with names:
+  - `ext:pdf` · `type:image|video|audio|document|archive|code|exe`
+  - `path:downloads` · `size:>100MB` · `modified:<7d` · `!exclude`
 - Filter results by All / Files / Folders
 - Sortable columns: Name, Path, Size, Modified
-- Shell icons per file extension via the Windows shell
-- Drive selector for every NTFS volume
-- Double-click to open, right-click for Reveal in Explorer / Copy path
-- Keyboard shortcuts: `Ctrl+F`, `F5`, `Esc`, `Ctrl+C`
-- Bundled `mftdump.exe` CLI for MFT diagnostics
-- Portable — no installer, just a folder with the exe and its DLLs
+- Shell icons per file extension (cached)
+
+### Multi-drive & live updates
+- **All NTFS volumes at once** — "All Drives" scans in parallel, tags each hit with its drive
+- **USN Journal live updates** — file creates / renames / deletes appear in results within a second, no rescan
+- **Persistent index cache** in `%LOCALAPPDATA%\Argus\<drive>.aix` — subsequent launches load in <1 s and catch up via USN
+
+### NTFS deep dive
+- Right-click **NTFS details** shows the raw MFT record, hardlinks (every `$FILE_NAME` attribute) and Alternate Data Streams — things Explorer hides
+- Bundled `mftdump.exe` CLI for volume geometry / MFT record inspection
+
+### Tools
+- **Duplicate finder** (Tools menu) — size bucket → first-64 KB FNV-1a hash pipeline, tree grouped by wasted space
+- **`argus-cli.exe`** for scripting from PowerShell or CMD — never needs elevation, reads the cache
+
+### Power-user shortcuts
+| Key | Action |
+|---|---|
+| `Ctrl+F` | Focus & select the search field |
+| `F5` | Rescan current drive(s) |
+| `Esc` | Clear search |
+| `Ctrl+C` | Copy full path(s) of selection |
+| `Ctrl+Enter` | Open the containing folder |
+| `Alt+Enter` | Windows Properties dialog |
+| `Delete` | Move to Recycle Bin (with prompt) |
 
 ## Roadmap
 
@@ -47,9 +74,12 @@ requires elevated privileges).
 |---|---|
 | v0.1 GUI with live search on a single drive | ✅ released |
 | v0.2 Sorting, shell icons, wildcard/regex, filters, hotkeys | ✅ released |
-| v0.3 USN Journal live updates + persistent index cache | 🔨 next |
-| v0.4 Content search inside text files, column configuration | planned |
-| v0.5 Portable distribution polish + first stable | planned |
+| v0.3 USN Journal live updates + persistent index cache | ✅ released |
+| v0.4 Advanced query syntax + multi-drive | ✅ released |
+| v0.5 NTFS details (hardlinks + ADS), console CLI | ✅ released |
+| v0.6 Fuzzy search, duplicate finder, power shortcuts | ✅ released |
+| v0.7 GitHub Actions CI, screenshots, polishing | 🔨 next |
+| v0.8 Content search inside text files | planned |
 
 ## Build from source (Windows, MSYS2 + MinGW-w64)
 
