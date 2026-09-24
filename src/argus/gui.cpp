@@ -834,9 +834,12 @@ MainWindow::MainWindow() {
     auto* helpMenu = menuBar()->addMenu("Help");
     auto* aAbout = helpMenu->addAction("About Argus");
     connect(aAbout, &QAction::triggered, this, [this]{
+#ifndef ARGUS_VERSION
+#  define ARGUS_VERSION "dev"
+#endif
         QMessageBox::about(this, "About Argus",
             "<h3>Argus — Instant NTFS File Search</h3>"
-            "<p>Version 0.6.0. MIT-licensed C++20 + Qt6.</p>"
+            "<p>Version " ARGUS_VERSION ". MIT-licensed C++20 + Qt6.</p>"
             "<p><a href='https://github.com/0x4Devs/argus'>github.com/0x4Devs/argus</a></p>");
     });
 

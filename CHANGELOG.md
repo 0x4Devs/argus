@@ -3,6 +3,13 @@
 All notable changes to Argus are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.7.1] — 2026-09-25
+
+### Fixed
+- About dialog was still hardcoded to "Version 0.6.0". The version string
+  is now derived from `PROJECT_VERSION` via a compile-time
+  `ARGUS_VERSION` macro so it always matches the release.
+
 ## [v0.7.0] — 2026-09-25
 
 ### Added
