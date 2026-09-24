@@ -72,6 +72,7 @@ std::vector<uint32_t> Search(const Index& index,
             if ((i & 0xFFFF) == 0 && cancel && cancel->load(std::memory_order_relaxed))
                 return out;
             const auto& e = entries[i];
+            if (e.flags & kFlagDeleted) continue;
             if (opt.files_only && (e.flags & kFlagDirectory)) continue;
             if (opt.dirs_only  && !(e.flags & kFlagDirectory)) continue;
             if (contains_ci(pool.data() + e.name_offset, e.name_length,
@@ -98,9 +99,9 @@ std::vector<uint32_t> Search(const Index& index,
         if ((i & 0xFFFF) == 0 && cancel && cancel->load(std::memory_order_relaxed))
             return out;
         const auto& e = entries[i];
+        if (e.flags & kFlagDeleted) continue;
         if (opt.files_only && (e.flags & kFlagDirectory)) continue;
         if (opt.dirs_only  && !(e.flags & kFlagDirectory)) continue;
-        // std::regex_search matched Substrings ohne ^$ Anker — wie Substring-Modus.
         const wchar_t* p = pool.data() + e.name_offset;
         if (std::regex_search(p, p + e.name_length, re)) {
             out.push_back(i);

@@ -48,6 +48,7 @@
 #include <thread>
 
 #include "core/index.h"
+#include "core/ntfs.h"
 #include "core/search.h"
 
 // ================== IconCache ==========================================
@@ -286,11 +287,15 @@ private:
 
     QTimer*       poll_timer_;
     QTimer*       debounce_;
+    QTimer*       usn_timer_;
 
     argus::Index index_;
     argus::Index::ScanStats stats_;
     std::thread scan_thread_;
     std::atomic<bool> scan_cancelled_{false};
+
+    void pollUsn();
+    void loadOrScan();
 };
 
 MainWindow::MainWindow() {
@@ -391,6 +396,11 @@ MainWindow::MainWindow() {
     poll_timer_->setInterval(80);
     connect(poll_timer_, &QTimer::timeout, this, &MainWindow::pollScan);
 
+    // USN Journal polling — sammelt Live-Aenderungen alle 700 ms.
+    usn_timer_ = new QTimer(this);
+    usn_timer_->setInterval(700);
+    connect(usn_timer_, &QTimer::timeout, this, &MainWindow::pollUsn);
+
     // -------- Signals --------
     connect(search_, &QLineEdit::textChanged, this, &MainWindow::onSearchTextChanged);
     connect(table_,  &QTableView::activated,  this, &MainWindow::onActivated);
@@ -423,17 +433,74 @@ MainWindow::MainWindow() {
     sc_copy->setContext(Qt::WidgetShortcut);
     connect(sc_copy, &QShortcut::activated, this, &MainWindow::copySelectedPaths);
 
-    startScan();
+    loadOrScan();
 }
 
 MainWindow::~MainWindow() {
     scan_cancelled_.store(true);
     if (scan_thread_.joinable()) scan_thread_.join();
+    // Aktuellen Index speichern falls sinnvoll.
+    if (index_.entry_count() > 0) {
+        auto cache = argus::CacheFilePath(drive_combo_->currentText().at(0).toUpper().unicode());
+        if (!cache.empty()) index_.SaveTo(cache);
+    }
+}
+
+// Versucht zuerst aus dem Cache zu laden. Klappt das + Volume-Serial passt,
+// nur ein schneller USN-Catch-up. Sonst voller Scan.
+void MainWindow::loadOrScan() {
+    wchar_t drive = drive_combo_->currentText().at(0).toUpper().unicode();
+    auto cache_path = argus::CacheFilePath(drive);
+    if (cache_path.empty()) { startScan(); return; }
+
+    if (!index_.LoadFrom(cache_path)) { startScan(); return; }
+
+    // Volume-Serial gegen aktuelles Volume abgleichen.
+    wchar_t path[16];
+    swprintf(path, 16, L"\\\\.\\%c:", drive);
+    HANDLE h = CreateFileW(path, GENERIC_READ,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE,
+                          nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { startScan(); return; }
+    argus::ntfs::BootSector bs{};
+    LARGE_INTEGER zero{}; zero.QuadPart = 0;
+    SetFilePointerEx(h, zero, nullptr, FILE_BEGIN);
+    DWORD got = 0;
+    ReadFile(h, &bs, sizeof(bs), &got, nullptr);
+    CloseHandle(h);
+    if (got != sizeof(bs) || bs.volume_serial != index_.volume_serial()) {
+        startScan();
+        return;
+    }
+
+    // Cache ist gueltig — USN-Catch-up laufen lassen und weiter.
+    auto st = index_.ApplyUsnChanges();
+    if (st.rolled_over) { startScan(); return; }
+
+    search_->setEnabled(true);
+    search_->setFocus();
+    updateStatusReady();
+    usn_timer_->start();
+}
+
+void MainWindow::pollUsn() {
+    if (index_.entry_count() == 0) return;
+    auto st = index_.ApplyUsnChanges();
+    if (st.rolled_over) {
+        usn_timer_->stop();
+        startScan();
+        return;
+    }
+    if (st.added || st.renamed || st.deleted) {
+        // Nur Aenderungen neu suchen falls Suchfeld befuellt.
+        if (!search_->text().isEmpty()) runSearch();
+    }
 }
 
 void MainWindow::startScan() {
     scan_cancelled_.store(true);
     if (scan_thread_.joinable()) scan_thread_.join();
+    usn_timer_->stop();
 
     scan_cancelled_.store(false);
     stats_.records_seen.store(0);
@@ -490,6 +557,11 @@ void MainWindow::pollScan() {
         search_->setFocus();
         updateStatusReady();
         runSearch();  // update view if query already present
+
+        // Nach jedem erfolgreichen Scan Cache schreiben und USN-Polling starten.
+        auto cache = argus::CacheFilePath(drive_combo_->currentText().at(0).toUpper().unicode());
+        if (!cache.empty()) index_.SaveTo(cache);
+        usn_timer_->start();
     }
 }
 
@@ -592,7 +664,7 @@ void MainWindow::copySelectedPaths() {
     QApplication::clipboard()->setText(lines.join("\n"));
 }
 
-void MainWindow::onDriveChanged(int) { startScan(); }
+void MainWindow::onDriveChanged(int) { loadOrScan(); }
 
 // ================== Entry ================================================
 

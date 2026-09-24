@@ -1,8 +1,11 @@
 #include "core/index.h"
 
 #include <windows.h>
+#include <winioctl.h>
+#include <shlobj.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 
@@ -226,11 +229,230 @@ bool Index::ScanDrive(wchar_t drive, ScanStats* stats) {
         }
     }
 
+    // Volume Serial merken (aus Boot-Sektor).
+    volume_serial_ = bs.volume_serial;
+
+    // USN Journal Zustand abfragen — falls das Journal noch nicht existiert,
+    // versuchen es zu erzeugen. Fehlschlag ist nicht fatal (Live-Updates dann
+    // deaktiviert, Suche funktioniert trotzdem).
+    USN_JOURNAL_DATA jd{};
+    DWORD ret = 0;
+    if (DeviceIoControl(h, FSCTL_QUERY_USN_JOURNAL, nullptr, 0,
+                       &jd, sizeof(jd), &ret, nullptr)) {
+        usn_journal_id_ = jd.UsnJournalID;
+        next_usn_       = jd.NextUsn;
+    } else {
+        CREATE_USN_JOURNAL_DATA cj{};
+        cj.MaximumSize   = 32ULL * 1024 * 1024;
+        cj.AllocationDelta = 8ULL * 1024 * 1024;
+        if (DeviceIoControl(h, FSCTL_CREATE_USN_JOURNAL, &cj, sizeof(cj),
+                           nullptr, 0, &ret, nullptr) &&
+            DeviceIoControl(h, FSCTL_QUERY_USN_JOURNAL, nullptr, 0,
+                           &jd, sizeof(jd), &ret, nullptr)) {
+            usn_journal_id_ = jd.UsnJournalID;
+            next_usn_       = jd.NextUsn;
+        }
+    }
+
     if (stats) {
         stats->records_seen.store(records_seen);
         stats->ok.store(true);
         stats->done.store(true);
     }
+    return true;
+}
+
+// ================== USN Journal ========================================
+
+Index::UsnStats Index::ApplyUsnChanges() {
+    UsnStats st{};
+    if (drive_letter_ == 0 || usn_journal_id_ == 0) return st;
+
+    wchar_t path[16];
+    swprintf(path, 16, L"\\\\.\\%c:", drive_letter_);
+    HANDLE h = CreateFileW(path, GENERIC_READ,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE,
+                          nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return st;
+    struct Closer { HANDLE h; ~Closer(){ CloseHandle(h); } } closer{h};
+
+    std::vector<uint8_t> buf(64 * 1024);
+    READ_USN_JOURNAL_DATA in{};
+    in.UsnJournalID    = usn_journal_id_;
+    in.StartUsn        = next_usn_;
+    in.ReasonMask      = USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE
+                        | USN_REASON_RENAME_NEW_NAME | USN_REASON_CLOSE;
+    in.ReturnOnlyOnClose = 1;
+    in.Timeout         = 0;
+    in.BytesToWaitFor  = 0;
+
+    // Bounded loop damit wir bei sehr aktiven Volumes nicht ewig blockieren.
+    int rounds = 0;
+    while (rounds++ < 16) {
+        DWORD got = 0;
+        BOOL ok = DeviceIoControl(h, FSCTL_READ_USN_JOURNAL, &in, sizeof(in),
+                                  buf.data(), (DWORD)buf.size(), &got, nullptr);
+        if (!ok) {
+            DWORD err = GetLastError();
+            if (err == ERROR_JOURNAL_ENTRY_DELETED) st.rolled_over = true;
+            break;
+        }
+        if (got <= sizeof(USN)) break;    // nur die naechste USN, kein Record
+
+        // Erste 8 Bytes = naechste USN.
+        USN next = *reinterpret_cast<USN*>(buf.data());
+        size_t off = sizeof(USN);
+        while (off + sizeof(USN_RECORD) <= got) {
+            auto* r = reinterpret_cast<USN_RECORD*>(buf.data() + off);
+            if (r->RecordLength == 0) break;
+            if (r->MajorVersion != 2) { off += r->RecordLength; continue; }
+
+            const uint32_t mft_id    = uint32_t(r->FileReferenceNumber & 0xFFFFFFFFULL);
+            const uint32_t parent_id = uint32_t(r->ParentFileReferenceNumber & 0xFFFFFFFFULL);
+            const wchar_t* name_ptr  = reinterpret_cast<const wchar_t*>(
+                reinterpret_cast<uint8_t*>(r) + r->FileNameOffset);
+            const uint16_t name_len  = r->FileNameLength / 2u;
+            const bool is_dir        = (r->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            const uint64_t timestamp = uint64_t(r->TimeStamp.QuadPart);
+
+            const bool created  = (r->Reason & USN_REASON_FILE_CREATE)    != 0;
+            const bool renamed  = (r->Reason & USN_REASON_RENAME_NEW_NAME) != 0;
+            const bool deleted  = (r->Reason & USN_REASON_FILE_DELETE)    != 0;
+
+            // Alten Eintrag suchen (falls existiert).
+            uint32_t idx = UINT32_MAX;
+            if (mft_id < mft_to_idx_.size()) idx = mft_to_idx_[mft_id];
+
+            if (deleted && idx != UINT32_MAX) {
+                entries_[idx].flags |= kFlagDeleted;
+                st.deleted++;
+            } else if (created && idx == UINT32_MAX) {
+                // Neuer Eintrag: Name in Pool, Entry anhaengen, mft_to_idx aktualisieren.
+                Entry e{};
+                e.parent_mft    = parent_id;
+                e.name_offset   = uint32_t(name_pool_.size());
+                name_pool_.insert(name_pool_.end(), name_ptr, name_ptr + name_len);
+                e.name_length   = name_len;
+                e.flags         = is_dir ? kFlagDirectory : 0;
+                e.size          = 0;         // USN kennt die Groesse nicht
+                e.modified_time = timestamp;
+                const uint32_t new_idx = uint32_t(entries_.size());
+                entries_.push_back(e);
+                if (mft_id >= mft_to_idx_.size())
+                    mft_to_idx_.resize(mft_id + 1, UINT32_MAX);
+                mft_to_idx_[mft_id] = new_idx;
+                st.added++;
+            } else if (renamed && idx != UINT32_MAX) {
+                // Nur Name aktualisieren — Rest bleibt.
+                Entry& e = entries_[idx];
+                e.name_offset = uint32_t(name_pool_.size());
+                name_pool_.insert(name_pool_.end(), name_ptr, name_ptr + name_len);
+                e.name_length = name_len;
+                e.parent_mft  = parent_id;
+                e.modified_time = timestamp;
+                if (e.flags & kFlagDeleted) e.flags &= ~kFlagDeleted;
+                st.renamed++;
+            }
+
+            off += r->RecordLength;
+        }
+        next_usn_ = uint64_t(next);
+        in.StartUsn = next;
+    }
+    return st;
+}
+
+// ================== Persistenz =========================================
+
+namespace {
+
+constexpr char     kMagic[8] = {'A','R','G','I','D','X','0','1'};
+constexpr uint32_t kVersion  = 1;
+
+bool WriteAll(FILE* f, const void* data, size_t n) {
+    return std::fwrite(data, 1, n, f) == n;
+}
+bool ReadAll(FILE* f, void* data, size_t n) {
+    return std::fread(data, 1, n, f) == n;
+}
+
+} // namespace
+
+std::wstring CacheFilePath(wchar_t drive_letter) {
+    wchar_t appdata[MAX_PATH];
+    if (SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr,
+                        SHGFP_TYPE_CURRENT, appdata) != S_OK) {
+        return {};
+    }
+    std::wstring dir = appdata;
+    dir.append(L"\\Argus");
+    CreateDirectoryW(dir.c_str(), nullptr);
+    wchar_t path[MAX_PATH];
+    swprintf(path, MAX_PATH, L"%ls\\%c.aix", dir.c_str(), drive_letter);
+    return path;
+}
+
+bool Index::SaveTo(const std::wstring& path) const {
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    if (!f) return false;
+    struct Closer { FILE* f; ~Closer(){ if (f) std::fclose(f); } } cl{f};
+
+    if (!WriteAll(f, kMagic, 8)) return false;
+    if (!WriteAll(f, &kVersion, 4)) return false;
+    uint32_t dl = uint32_t(drive_letter_);
+    if (!WriteAll(f, &dl, 4)) return false;
+    if (!WriteAll(f, &volume_serial_, 8)) return false;
+    if (!WriteAll(f, &usn_journal_id_, 8)) return false;
+    if (!WriteAll(f, &next_usn_, 8)) return false;
+
+    uint64_t ec = entries_.size();
+    uint64_t nc = name_pool_.size();
+    uint64_t mc = mft_to_idx_.size();
+    if (!WriteAll(f, &ec, 8)) return false;
+    if (!WriteAll(f, &nc, 8)) return false;
+    if (!WriteAll(f, &mc, 8)) return false;
+
+    if (ec > 0 && !WriteAll(f, entries_.data(), ec * sizeof(Entry))) return false;
+    if (nc > 0 && !WriteAll(f, name_pool_.data(), nc * sizeof(wchar_t))) return false;
+    if (mc > 0 && !WriteAll(f, mft_to_idx_.data(), mc * sizeof(uint32_t))) return false;
+    return true;
+}
+
+bool Index::LoadFrom(const std::wstring& path) {
+    FILE* f = _wfopen(path.c_str(), L"rb");
+    if (!f) return false;
+    struct Closer { FILE* f; ~Closer(){ if (f) std::fclose(f); } } cl{f};
+
+    char magic[8];
+    uint32_t version, dl;
+    uint64_t vs, jid, nusn, ec, nc, mc;
+    if (!ReadAll(f, magic, 8) || std::memcmp(magic, kMagic, 8) != 0) return false;
+    if (!ReadAll(f, &version, 4) || version != kVersion) return false;
+    if (!ReadAll(f, &dl, 4)) return false;
+    if (!ReadAll(f, &vs, 8)) return false;
+    if (!ReadAll(f, &jid, 8)) return false;
+    if (!ReadAll(f, &nusn, 8)) return false;
+    if (!ReadAll(f, &ec, 8)) return false;
+    if (!ReadAll(f, &nc, 8)) return false;
+    if (!ReadAll(f, &mc, 8)) return false;
+
+    // Plausibilitaets-Grenzen um beliebige Files nicht Speicher-fluten zu lassen.
+    if (ec > 100ULL * 1000 * 1000) return false;
+    if (nc > 4ULL  * 1024 * 1024 * 1024ULL / 2) return false;
+    if (mc > 200ULL * 1000 * 1000) return false;
+
+    entries_.assign(ec, {});
+    name_pool_.assign(nc, 0);
+    mft_to_idx_.assign(mc, UINT32_MAX);
+
+    if (ec > 0 && !ReadAll(f, entries_.data(), ec * sizeof(Entry))) return false;
+    if (nc > 0 && !ReadAll(f, name_pool_.data(), nc * sizeof(wchar_t))) return false;
+    if (mc > 0 && !ReadAll(f, mft_to_idx_.data(), mc * sizeof(uint32_t))) return false;
+
+    drive_letter_   = wchar_t(dl);
+    volume_serial_  = vs;
+    usn_journal_id_ = jid;
+    next_usn_       = nusn;
     return true;
 }
 

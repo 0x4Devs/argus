@@ -25,6 +25,7 @@ struct Entry {
 static_assert(sizeof(Entry) == 32, "Entry must stay 32 bytes");
 
 constexpr uint16_t kFlagDirectory = 1u << 0;
+constexpr uint16_t kFlagDeleted   = 1u << 15;  // via USN als geloescht markiert
 
 class Index {
 public:
@@ -57,12 +58,39 @@ public:
     const std::vector<Entry>&   entries() const { return entries_; }
     const std::vector<wchar_t>& name_pool() const { return name_pool_; }
 
+    // ---------- Persistenz ----------
+    // Binaerformat: Magic "ARGIDX01", Version, drive_letter, volume_serial,
+    // usn_journal_id, next_usn, entries, name_pool, mft_to_idx.
+    bool SaveTo(const std::wstring& path) const;
+    bool LoadFrom(const std::wstring& path);
+
+    // ---------- USN Journal ----------
+    struct UsnStats {
+        uint64_t added   = 0;
+        uint64_t renamed = 0;
+        uint64_t deleted = 0;
+        bool     rolled_over = false;  // Journal ist zu weit fortgeschritten
+    };
+    // Liest neue USN-Records seit next_usn_ und wendet Aenderungen im Speicher
+    // an. Blockiert bis kein weiterer Record da ist. Braucht offenes \\.\<drive>:.
+    UsnStats ApplyUsnChanges();
+
+    uint64_t volume_serial() const   { return volume_serial_; }
+    uint64_t usn_journal_id() const  { return usn_journal_id_; }
+    uint64_t next_usn() const        { return next_usn_; }
+
 private:
     std::vector<Entry>    entries_;
     std::vector<wchar_t>  name_pool_;
     // MFT-Record-Nr. -> Index in entries_. UINT32_MAX = kein Eintrag.
     std::vector<uint32_t> mft_to_idx_;
-    wchar_t               drive_letter_ = 0;
+    wchar_t               drive_letter_    = 0;
+    uint64_t              volume_serial_   = 0;
+    uint64_t              usn_journal_id_  = 0;
+    uint64_t              next_usn_        = 0;
 };
+
+// Wo Argus seinen Cache ablegt: %LOCALAPPDATA%\Argus\<drive>.aix
+std::wstring CacheFilePath(wchar_t drive_letter);
 
 } // namespace argus
