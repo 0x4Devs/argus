@@ -1,5 +1,6 @@
 // Argus — GUI (Qt6 Widgets).
-// Startet als Admin (Manifest), indiziert eine Platte, bietet Live-Suche.
+// v0.2.0: Sortierung, Shell-Icons, Regex/Wildcard-Modes, Files/Folders-Filter,
+//         Keyboard-Shortcuts (Ctrl+F, F5, Esc, Ctrl+C).
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -9,33 +10,38 @@
 #include <QAbstractTableModel>
 #include <QAction>
 #include <QApplication>
+#include <QCheckBox>
 #include <QClipboard>
 #include <QComboBox>
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
-#include <QFileIconProvider>
 #include <QFileInfo>
 #include <QHBoxLayout>
+#include <QHash>
 #include <QHeaderView>
 #include <QIcon>
+#include <QImage>
 #include <QLabel>
 #include <QLineEdit>
 #include <QLocale>
 #include <QMainWindow>
 #include <QMenu>
 #include <QMessageBox>
+#include <QPixmap>
 #include <QProgressBar>
 #include <QPushButton>
-#include <QStandardPaths>
+#include <QShortcut>
 #include <QStatusBar>
 #include <QStyleFactory>
 #include <QTableView>
 #include <QThread>
 #include <QTimer>
+#include <QToolBar>
 #include <QUrl>
 #include <QVBoxLayout>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -43,6 +49,62 @@
 
 #include "core/index.h"
 #include "core/search.h"
+
+// ================== IconCache ==========================================
+// Windows shell icons per extension via SHGetFileInfoW + SHGFI_USEFILEATTRIBUTES.
+// Cached: an extension only ever hits the shell once.
+
+class IconCache {
+public:
+    IconCache() {
+        folder_ = shellIconForPath(L"", true);
+        generic_ = shellIconForPath(L"file", false);
+    }
+
+    QIcon iconFor(std::wstring_view name, bool isDir) {
+        if (isDir) return folder_;
+        // Extension aus name extrahieren.
+        int dot = -1;
+        for (int i = int(name.size()) - 1; i >= 0; --i) {
+            if (name[i] == L'.') { dot = i; break; }
+            if (name[i] == L'\\' || name[i] == L'/') break;
+        }
+        if (dot < 0 || dot == int(name.size()) - 1) return generic_;
+
+        // Lowercase key.
+        QString key;
+        key.reserve(int(name.size()) - dot);
+        for (int i = dot + 1; i < int(name.size()); ++i) {
+            wchar_t c = name[i];
+            if (c >= L'A' && c <= L'Z') c += 32;
+            key.append(QChar(c));
+        }
+        auto it = ext_cache_.constFind(key);
+        if (it != ext_cache_.constEnd()) return it.value();
+
+        std::wstring fake = L"argus.";
+        fake.append(name.data() + dot + 1, name.size() - dot - 1);
+        QIcon ic = shellIconForPath(fake.c_str(), false);
+        if (ic.isNull()) ic = generic_;
+        ext_cache_.insert(key, ic);
+        return ic;
+    }
+
+private:
+    static QIcon shellIconForPath(const wchar_t* path, bool asFolder) {
+        SHFILEINFOW sfi{};
+        UINT flags = SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES;
+        DWORD attrs = asFolder ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+        if (!SHGetFileInfoW(path, attrs, &sfi, sizeof(sfi), flags)) return {};
+        QImage img = QImage::fromHICON(sfi.hIcon);
+        DestroyIcon(sfi.hIcon);
+        return QIcon(QPixmap::fromImage(img));
+    }
+
+    QIcon folder_;
+    QIcon generic_;
+    QHash<QString, QIcon> ext_cache_;
+};
 
 // ================== FileModel ==========================================
 
@@ -54,10 +116,12 @@ public:
     FileModel(QObject* parent = nullptr) : QAbstractTableModel(parent) {}
 
     void setIndex(const argus::Index* idx) { index_ = idx; }
+    void setIconCache(IconCache* c)        { icons_ = c; }
 
     void setResults(std::vector<uint32_t>&& ids) {
         beginResetModel();
         results_ = std::move(ids);
+        applySort();
         endResetModel();
     }
 
@@ -70,9 +134,9 @@ public:
         if (role != Qt::DisplayRole || orient != Qt::Horizontal) return {};
         switch (section) {
             case ColName:     return "Name";
-            case ColPath:     return "Pfad";
-            case ColSize:     return "Groesse";
-            case ColModified: return "Geaendert";
+            case ColPath:     return "Path";
+            case ColSize:     return "Size";
+            case ColModified: return "Modified";
         }
         return {};
     }
@@ -80,9 +144,12 @@ public:
     QVariant data(const QModelIndex& mi, int role) const override {
         if (!index_ || !mi.isValid()) return {};
         const uint32_t id = results_[mi.row()];
+        const auto& e = index_->entry(id);
 
+        if (role == Qt::DecorationRole && mi.column() == ColName && icons_) {
+            return icons_->iconFor(index_->name(id), index_->is_directory(id));
+        }
         if (role == Qt::DisplayRole) {
-            const auto& e = index_->entry(id);
             switch (mi.column()) {
                 case ColName: {
                     auto sv = index_->name(id);
@@ -90,8 +157,6 @@ public:
                 }
                 case ColPath: {
                     auto p = index_->full_path(id);
-                    // Nur den Elter zeigen (ohne den Datei-Basename),
-                    // sonst dupliziert es die Name-Spalte.
                     int slash = int(p.size()) - 1;
                     while (slash >= 0 && p[slash] != L'\\') --slash;
                     if (slash > 0)
@@ -104,18 +169,25 @@ public:
                 }
                 case ColModified: {
                     if (e.modified_time == 0) return QVariant();
-                    // FILETIME -> QDateTime (100ns since 1601, epoch offset)
                     const qint64 filetime_epoch_ms = -11644473600000LL;
                     qint64 ms = qint64(e.modified_time / 10000ULL) + filetime_epoch_ms;
                     return QDateTime::fromMSecsSinceEpoch(ms).toString("yyyy-MM-dd HH:mm");
                 }
             }
         }
-        if (role == Qt::TextAlignmentRole) {
-            if (mi.column() == ColSize) return int(Qt::AlignRight | Qt::AlignVCenter);
+        if (role == Qt::TextAlignmentRole && mi.column() == ColSize) {
+            return int(Qt::AlignRight | Qt::AlignVCenter);
         }
         if (role == Qt::UserRole) return id;
         return {};
+    }
+
+    void sort(int column, Qt::SortOrder order) override {
+        sort_column_ = column;
+        sort_order_  = order;
+        beginResetModel();
+        applySort();
+        endResetModel();
     }
 
     uint32_t entryIdFor(int row) const {
@@ -124,8 +196,52 @@ public:
     }
 
 private:
+    void applySort() {
+        if (!index_ || results_.empty()) return;
+        const auto& idx = *index_;
+        const int col   = sort_column_;
+        const bool asc  = (sort_order_ == Qt::AscendingOrder);
+
+        auto cmp = [&](uint32_t a, uint32_t b) -> bool {
+            const auto& ea = idx.entry(a);
+            const auto& eb = idx.entry(b);
+            switch (col) {
+                case ColSize:
+                    if (ea.size != eb.size) return asc ? ea.size < eb.size : ea.size > eb.size;
+                    break;
+                case ColModified:
+                    if (ea.modified_time != eb.modified_time)
+                        return asc ? ea.modified_time < eb.modified_time
+                                    : ea.modified_time > eb.modified_time;
+                    break;
+                case ColPath: {
+                    auto pa = idx.full_path(a);
+                    auto pb = idx.full_path(b);
+                    int c = _wcsicmp(pa.c_str(), pb.c_str());
+                    if (c != 0) return asc ? c < 0 : c > 0;
+                    break;
+                }
+                case ColName:
+                default: {
+                    auto na = idx.name(a);
+                    auto nb = idx.name(b);
+                    std::wstring wa(na.data(), na.size());
+                    std::wstring wb(nb.data(), nb.size());
+                    int c = _wcsicmp(wa.c_str(), wb.c_str());
+                    if (c != 0) return asc ? c < 0 : c > 0;
+                    break;
+                }
+            }
+            return a < b;
+        };
+        std::sort(results_.begin(), results_.end(), cmp);
+    }
+
     const argus::Index* index_ = nullptr;
+    IconCache*          icons_ = nullptr;
     std::vector<uint32_t> results_;
+    int         sort_column_ = -1;
+    Qt::SortOrder sort_order_ = Qt::AscendingOrder;
 };
 
 // ================== MainWindow =========================================
@@ -143,18 +259,31 @@ private slots:
     void onActivated(const QModelIndex&);
     void onContextMenu(const QPoint&);
     void onDriveChanged(int);
+    void onModeChanged(int);
+    void onFilterChanged(int);
+    void copySelectedPaths();
 
 private:
     void startScan();
     void openInExplorer(uint32_t id);
     void openFile(uint32_t id);
+    void updateStatusReady();
 
+    // Toolbar
     QLineEdit*    search_;
     QComboBox*    drive_combo_;
+    QComboBox*    mode_combo_;
+    QComboBox*    filter_combo_;
+
+    // Table
     QTableView*   table_;
     FileModel*    model_;
+    IconCache     icon_cache_;
+
+    // Statusbar
     QLabel*       status_left_;
     QProgressBar* progress_;
+
     QTimer*       poll_timer_;
     QTimer*       debounce_;
 
@@ -162,15 +291,16 @@ private:
     argus::Index::ScanStats stats_;
     std::thread scan_thread_;
     std::atomic<bool> scan_cancelled_{false};
-
-    std::atomic<bool> search_cancel_{false};
 };
 
 MainWindow::MainWindow() {
     setWindowTitle("Argus — Instant File Search");
-    resize(1100, 680);
+    resize(1180, 720);
 
-    // --- Header: Drive-Dropdown + Suchfeld ---
+    if (QStyleFactory::keys().contains("windows11", Qt::CaseInsensitive))
+        QApplication::setStyle(QStyleFactory::create("windows11"));
+
+    // -------- Toolbar (drive + search + mode + filter) --------
     auto* central = new QWidget();
     setCentralWidget(central);
     auto* v = new QVBoxLayout(central);
@@ -179,8 +309,8 @@ MainWindow::MainWindow() {
 
     auto* head = new QHBoxLayout();
     head->setSpacing(8);
+
     drive_combo_ = new QComboBox();
-    // Alle bereiten NTFS-Laufwerke (nur mounted drives).
     DWORD mask = GetLogicalDrives();
     for (int i = 0; i < 26; ++i) {
         if (!(mask & (1u << i))) continue;
@@ -195,37 +325,53 @@ MainWindow::MainWindow() {
     drive_combo_->setFixedWidth(80);
 
     search_ = new QLineEdit();
-    search_->setPlaceholderText("Suchen — tippe einen Namen (auch Teil-Wort)…");
+    search_->setPlaceholderText("Search — type any part of a name…");
     search_->setClearButtonEnabled(true);
     search_->setEnabled(false);
 
+    mode_combo_ = new QComboBox();
+    mode_combo_->addItem("Text");       // Substring
+    mode_combo_->addItem("Wildcard");   // *.mp4
+    mode_combo_->addItem("Regex");
+    mode_combo_->setFixedWidth(100);
+
+    filter_combo_ = new QComboBox();
+    filter_combo_->addItem("All");
+    filter_combo_->addItem("Files");
+    filter_combo_->addItem("Folders");
+    filter_combo_->setFixedWidth(100);
+
     head->addWidget(drive_combo_);
     head->addWidget(search_, 1);
+    head->addWidget(mode_combo_);
+    head->addWidget(filter_combo_);
     v->addLayout(head);
 
-    // --- Table ---
+    // -------- Table --------
     table_ = new QTableView();
     model_ = new FileModel(this);
     model_->setIndex(&index_);
+    model_->setIconCache(&icon_cache_);
     table_->setModel(model_);
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     table_->setSelectionMode(QAbstractItemView::ExtendedSelection);
     table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
     table_->setAlternatingRowColors(true);
     table_->setShowGrid(false);
+    table_->setSortingEnabled(true);
     table_->verticalHeader()->setVisible(false);
     table_->verticalHeader()->setDefaultSectionSize(22);
-    table_->horizontalHeader()->setStretchLastSection(false);
     table_->horizontalHeader()->setSectionResizeMode(FileModel::ColName,     QHeaderView::Interactive);
     table_->horizontalHeader()->setSectionResizeMode(FileModel::ColPath,     QHeaderView::Stretch);
     table_->horizontalHeader()->setSectionResizeMode(FileModel::ColSize,     QHeaderView::ResizeToContents);
     table_->horizontalHeader()->setSectionResizeMode(FileModel::ColModified, QHeaderView::ResizeToContents);
-    table_->setColumnWidth(FileModel::ColName, 260);
+    table_->setColumnWidth(FileModel::ColName, 280);
     table_->setContextMenuPolicy(Qt::CustomContextMenu);
+    table_->setIconSize(QSize(16, 16));
     v->addWidget(table_, 1);
 
-    // --- Statusbar ---
-    status_left_ = new QLabel("Bereit.");
+    // -------- Statusbar --------
+    status_left_ = new QLabel("Ready.");
     progress_ = new QProgressBar();
     progress_->setRange(0, 100);
     progress_->setValue(0);
@@ -235,30 +381,48 @@ MainWindow::MainWindow() {
     statusBar()->addWidget(status_left_, 1);
     statusBar()->addPermanentWidget(progress_);
 
-    // Native Windows-11-Style.
-    if (QStyleFactory::keys().contains("windows11", Qt::CaseInsensitive))
-        QApplication::setStyle(QStyleFactory::create("windows11"));
-
-    // Debounce fuer Live-Suche.
+    // -------- Timers --------
     debounce_ = new QTimer(this);
     debounce_->setSingleShot(true);
     debounce_->setInterval(150);
     connect(debounce_, &QTimer::timeout, this, &MainWindow::runSearch);
 
-    // Scan-Progress Polling.
     poll_timer_ = new QTimer(this);
     poll_timer_->setInterval(80);
     connect(poll_timer_, &QTimer::timeout, this, &MainWindow::pollScan);
 
-    // Connections.
+    // -------- Signals --------
     connect(search_, &QLineEdit::textChanged, this, &MainWindow::onSearchTextChanged);
     connect(table_,  &QTableView::activated,  this, &MainWindow::onActivated);
     connect(table_,  &QTableView::customContextMenuRequested,
             this, &MainWindow::onContextMenu);
     connect(drive_combo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &MainWindow::onDriveChanged);
+    connect(mode_combo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &MainWindow::onModeChanged);
+    connect(filter_combo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &MainWindow::onFilterChanged);
 
-    // Direkt scannen.
+    // -------- Keyboard shortcuts --------
+    // Ctrl+F: Focus + select-all search box.
+    auto* sc_find = new QShortcut(QKeySequence("Ctrl+F"), this);
+    connect(sc_find, &QShortcut::activated, this, [this]{
+        search_->setFocus();
+        search_->selectAll();
+    });
+    // F5: rescan current drive.
+    auto* sc_rescan = new QShortcut(QKeySequence("F5"), this);
+    connect(sc_rescan, &QShortcut::activated, this, &MainWindow::startScan);
+    // Esc while search box has focus: clear.
+    auto* sc_esc = new QShortcut(QKeySequence("Escape"), this);
+    connect(sc_esc, &QShortcut::activated, this, [this]{
+        if (search_->hasFocus() && !search_->text().isEmpty()) search_->clear();
+    });
+    // Ctrl+C on table selection: copy full path(s).
+    auto* sc_copy = new QShortcut(QKeySequence::Copy, table_);
+    sc_copy->setContext(Qt::WidgetShortcut);
+    connect(sc_copy, &QShortcut::activated, this, &MainWindow::copySelectedPaths);
+
     startScan();
 }
 
@@ -268,11 +432,9 @@ MainWindow::~MainWindow() {
 }
 
 void MainWindow::startScan() {
-    // Vorherigen Scan abbrechen falls noch laeuft (drive-switch).
     scan_cancelled_.store(true);
     if (scan_thread_.joinable()) scan_thread_.join();
 
-    // Reset.
     scan_cancelled_.store(false);
     stats_.records_seen.store(0);
     stats_.total_records.store(0);
@@ -285,10 +447,9 @@ void MainWindow::startScan() {
     wchar_t drive = drive_combo_->currentText().at(0).toUpper().unicode();
 
     search_->setEnabled(false);
-    search_->clear();
     progress_->show();
     progress_->setValue(0);
-    status_left_->setText(QString("Indiziere %1: …").arg(drive_combo_->currentText()));
+    status_left_->setText(QString("Indexing %1: …").arg(drive_combo_->currentText()));
 
     scan_thread_ = std::thread([this, drive]{
         index_.ScanDrive(drive, &stats_);
@@ -304,7 +465,7 @@ void MainWindow::pollScan() {
     if (total > 0) {
         int pct = int(seen * 100 / total);
         progress_->setValue(pct);
-        status_left_->setText(QString("Indiziere %1: … %L2 / %L3 Records — %L4 Eintraege")
+        status_left_->setText(QString("Indexing %1: … %L2 / %L3 records — %L4 entries")
                               .arg(drive_combo_->currentText())
                               .arg(qulonglong(seen))
                               .arg(qulonglong(total))
@@ -317,37 +478,47 @@ void MainWindow::pollScan() {
 
         if (!stats_.ok.load()) {
             progress_->hide();
-            status_left_->setText("Fehler beim Lesen der MFT — braucht Argus als Administrator?");
+            status_left_->setText("MFT read failed — is Argus running as Administrator?");
             QMessageBox::warning(this, "Argus",
-                "Konnte die MFT nicht lesen.\n\n"
-                "Bitte pruefen: Wurde die Anwendung als Administrator gestartet? "
-                "Rohen NTFS-Zugriff koennen wir nur mit erhoehten Rechten.");
+                "Could not read the MFT.\n\n"
+                "Please make sure Argus was started as Administrator. "
+                "Raw NTFS access requires elevated privileges.");
             return;
         }
         progress_->hide();
-        status_left_->setText(
-            QString("Bereit — %L1 Eintraege auf %2").arg(qulonglong(ents)).arg(drive_combo_->currentText()));
         search_->setEnabled(true);
         search_->setFocus();
+        updateStatusReady();
+        runSearch();  // update view if query already present
     }
+}
+
+void MainWindow::updateStatusReady() {
+    status_left_->setText(QString("Ready — %L1 entries on %2")
+        .arg(qulonglong(index_.entry_count()))
+        .arg(drive_combo_->currentText()));
 }
 
 void MainWindow::onSearchTextChanged() {
     debounce_->start();
 }
 
+void MainWindow::onModeChanged(int)   { debounce_->start(); }
+void MainWindow::onFilterChanged(int) { debounce_->start(); }
+
 void MainWindow::runSearch() {
     const QString qtext = search_->text();
     if (qtext.isEmpty()) {
         model_->setResults({});
-        status_left_->setText(QString("Bereit — %L1 Eintraege auf %2")
-                              .arg(qulonglong(index_.entry_count()))
-                              .arg(drive_combo_->currentText()));
+        updateStatusReady();
         return;
     }
     std::wstring q = qtext.toStdWString();
     argus::SearchOptions opt;
-    opt.max_results = 5000;
+    opt.max_results = 10000;
+    opt.mode = static_cast<argus::SearchMode>(mode_combo_->currentIndex());
+    if (filter_combo_->currentIndex() == 1) opt.files_only = true;
+    if (filter_combo_->currentIndex() == 2) opt.dirs_only  = true;
 
     auto t0 = std::chrono::steady_clock::now();
     auto ids = argus::Search(index_, q, opt);
@@ -356,7 +527,7 @@ void MainWindow::runSearch() {
 
     const size_t total_hits = ids.size();
     model_->setResults(std::move(ids));
-    status_left_->setText(QString("%L1 Treffer  (%2 ms)")
+    status_left_->setText(QString("%L1 hits  (%2 ms)")
         .arg(qulonglong(total_hits))
         .arg(QString::number(ms, 'f', 1)));
 }
@@ -375,10 +546,10 @@ void MainWindow::onContextMenu(const QPoint& pos) {
     if (id == UINT32_MAX) return;
 
     QMenu menu(this);
-    auto* aOpen = menu.addAction(index_.is_directory(id) ? "Ordner oeffnen" : "Datei oeffnen");
-    auto* aReveal = menu.addAction("Im Explorer zeigen");
+    auto* aOpen = menu.addAction(index_.is_directory(id) ? "Open folder" : "Open file");
+    auto* aReveal = menu.addAction("Reveal in Explorer");
     menu.addSeparator();
-    auto* aCopyPath = menu.addAction("Pfad kopieren");
+    auto* aCopyPath = menu.addAction("Copy path");
     QAction* chosen = menu.exec(table_->viewport()->mapToGlobal(pos));
 
     if (chosen == aOpen) {
@@ -387,15 +558,12 @@ void MainWindow::onContextMenu(const QPoint& pos) {
     } else if (chosen == aReveal) {
         auto path = index_.full_path(id);
         QString qpath = QString::fromWCharArray(path.data(), int(path.size()));
-        // /select markiert die Datei im Explorer.
         QString param = "/select,\"" + QDir::toNativeSeparators(qpath) + "\"";
         ShellExecuteW(nullptr, L"open", L"explorer.exe",
                       reinterpret_cast<LPCWSTR>(param.utf16()),
                       nullptr, SW_SHOWNORMAL);
     } else if (chosen == aCopyPath) {
-        auto path = index_.full_path(id);
-        QApplication::clipboard()->setText(
-            QString::fromWCharArray(path.data(), int(path.size())));
+        copySelectedPaths();
     }
 }
 
@@ -411,9 +579,20 @@ void MainWindow::openFile(uint32_t id) {
         QString::fromWCharArray(path.data(), int(path.size()))));
 }
 
-void MainWindow::onDriveChanged(int) {
-    startScan();
+void MainWindow::copySelectedPaths() {
+    auto sel = table_->selectionModel()->selectedRows();
+    if (sel.isEmpty()) return;
+    QStringList lines;
+    for (const auto& mi : sel) {
+        uint32_t id = model_->entryIdFor(mi.row());
+        if (id == UINT32_MAX) continue;
+        auto p = index_.full_path(id);
+        lines << QString::fromWCharArray(p.data(), int(p.size()));
+    }
+    QApplication::clipboard()->setText(lines.join("\n"));
 }
+
+void MainWindow::onDriveChanged(int) { startScan(); }
 
 // ================== Entry ================================================
 

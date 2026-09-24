@@ -1,15 +1,14 @@
 #include "core/search.h"
 
 #include <cctype>
+#include <regex>
 
 namespace argus {
 
 namespace {
 
-// ASCII-lowercase — echte Unicode-Fall-Ordnung ist eine spaetere Ausbaustufe.
 inline wchar_t to_lower(wchar_t c) {
     if (c >= L'A' && c <= L'Z') return c + 32;
-    // Deutsche Umlaute + sz mitmachen.
     switch (c) {
         case L'Ä': return L'ä';
         case L'Ö': return L'ö';
@@ -19,8 +18,8 @@ inline wchar_t to_lower(wchar_t c) {
 }
 
 // Case-insensitive Substring, needle bereits lowercase.
-bool contains(const wchar_t* hay, size_t hay_len,
-              const wchar_t* needle, size_t needle_len) {
+bool contains_ci(const wchar_t* hay, size_t hay_len,
+                 const wchar_t* needle, size_t needle_len) {
     if (needle_len == 0) return true;
     if (hay_len < needle_len) return false;
     const size_t last = hay_len - needle_len;
@@ -34,6 +33,23 @@ bool contains(const wchar_t* hay, size_t hay_len,
     return false;
 }
 
+std::wstring wildcard_to_regex(std::wstring_view p) {
+    std::wstring r;
+    r.reserve(p.size() * 2);
+    for (wchar_t c : p) {
+        switch (c) {
+            case L'*':  r += L".*";   break;
+            case L'?':  r += L".";    break;
+            case L'.':  case L'\\': case L'+':  case L'(':
+            case L')':  case L'{':   case L'}': case L'|':
+            case L'^':  case L'$':   case L'[': case L']':
+                r += L'\\'; r += c;   break;
+            default:    r += c;       break;
+        }
+    }
+    return r;
+}
+
 } // namespace
 
 std::vector<uint32_t> Search(const Index& index,
@@ -43,23 +59,50 @@ std::vector<uint32_t> Search(const Index& index,
     std::vector<uint32_t> out;
     out.reserve(std::min<size_t>(opt.max_results, 1024));
 
-    std::wstring q(query);
-    for (auto& c : q) c = to_lower(c);
-
     const auto& entries = index.entries();
     const auto& pool    = index.name_pool();
     const size_t n      = entries.size();
 
+    // Substring: eigener Fast-Path.
+    if (opt.mode == SearchMode::Substring) {
+        std::wstring q(query);
+        for (auto& c : q) c = to_lower(c);
+
+        for (uint32_t i = 0; i < n; ++i) {
+            if ((i & 0xFFFF) == 0 && cancel && cancel->load(std::memory_order_relaxed))
+                return out;
+            const auto& e = entries[i];
+            if (opt.files_only && (e.flags & kFlagDirectory)) continue;
+            if (opt.dirs_only  && !(e.flags & kFlagDirectory)) continue;
+            if (contains_ci(pool.data() + e.name_offset, e.name_length,
+                            q.data(), q.size())) {
+                out.push_back(i);
+                if (out.size() >= opt.max_results) break;
+            }
+        }
+        return out;
+    }
+
+    // Wildcard oder Regex: std::wregex bauen.
+    std::wregex re;
+    try {
+        std::wstring pattern = (opt.mode == SearchMode::Wildcard)
+                              ? wildcard_to_regex(query)
+                              : std::wstring(query);
+        re.assign(pattern, std::regex::ECMAScript | std::regex::icase);
+    } catch (...) {
+        return out;  // ungueltiges Muster
+    }
+
     for (uint32_t i = 0; i < n; ++i) {
         if ((i & 0xFFFF) == 0 && cancel && cancel->load(std::memory_order_relaxed))
             return out;
-
         const auto& e = entries[i];
         if (opt.files_only && (e.flags & kFlagDirectory)) continue;
         if (opt.dirs_only  && !(e.flags & kFlagDirectory)) continue;
-
-        if (contains(pool.data() + e.name_offset, e.name_length,
-                     q.data(), q.size())) {
+        // std::regex_search matched Substrings ohne ^$ Anker — wie Substring-Modus.
+        const wchar_t* p = pool.data() + e.name_offset;
+        if (std::regex_search(p, p + e.name_length, re)) {
             out.push_back(i);
             if (out.size() >= opt.max_results) break;
         }

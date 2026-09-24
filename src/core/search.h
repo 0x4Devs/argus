@@ -12,15 +12,19 @@
 
 namespace argus {
 
-struct SearchOptions {
-    size_t max_results = 5000;
-    // Falls true, matched nur Dateien (keine Ordner).
-    bool   files_only  = false;
-    bool   dirs_only   = false;
+enum class SearchMode {
+    Substring = 0,   // "foo"      matches any name containing "foo"
+    Wildcard  = 1,   // "*.mp4"    * = any, ? = one char
+    Regex     = 2,   // ".*\\.mp4$" full ECMAScript regex
 };
 
-// Fuehrt eine Suche aus. Kann durch cancel abgebrochen werden (fuer async-Use).
-// Gibt die Entry-Indices der Treffer zurueck.
+struct SearchOptions {
+    size_t     max_results = 5000;
+    bool       files_only  = false;
+    bool       dirs_only   = false;
+    SearchMode mode        = SearchMode::Substring;
+};
+
 std::vector<uint32_t> Search(const Index& index,
                              std::wstring_view query,
                              const SearchOptions& opt = {},
