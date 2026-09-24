@@ -3,6 +3,8 @@
 #include <cctype>
 #include <regex>
 
+#include "core/query.h"
+
 namespace argus {
 
 namespace {
@@ -75,11 +77,12 @@ std::vector<uint32_t> Search(const Index& index,
             if (e.flags & kFlagDeleted) continue;
             if (opt.files_only && (e.flags & kFlagDirectory)) continue;
             if (opt.dirs_only  && !(e.flags & kFlagDirectory)) continue;
-            if (contains_ci(pool.data() + e.name_offset, e.name_length,
-                            q.data(), q.size())) {
-                out.push_back(i);
-                if (out.size() >= opt.max_results) break;
-            }
+            if (!contains_ci(pool.data() + e.name_offset, e.name_length,
+                             q.data(), q.size())) continue;
+            if (opt.advanced_query && !MatchQuery(*opt.advanced_query, index, i))
+                continue;
+            out.push_back(i);
+            if (out.size() >= opt.max_results) break;
         }
         return out;
     }
@@ -103,10 +106,10 @@ std::vector<uint32_t> Search(const Index& index,
         if (opt.files_only && (e.flags & kFlagDirectory)) continue;
         if (opt.dirs_only  && !(e.flags & kFlagDirectory)) continue;
         const wchar_t* p = pool.data() + e.name_offset;
-        if (std::regex_search(p, p + e.name_length, re)) {
-            out.push_back(i);
-            if (out.size() >= opt.max_results) break;
-        }
+        if (!std::regex_search(p, p + e.name_length, re)) continue;
+        if (opt.advanced_query && !MatchQuery(*opt.advanced_query, index, i)) continue;
+        out.push_back(i);
+        if (out.size() >= opt.max_results) break;
     }
     return out;
 }

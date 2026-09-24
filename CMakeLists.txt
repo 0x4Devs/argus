@@ -14,6 +14,8 @@ add_library(argus_core STATIC
     src/core/ntfs.cpp
     src/core/index.cpp
     src/core/search.cpp
+    src/core/query.cpp
+    src/core/multi_index.cpp
 )
 target_include_directories(argus_core PUBLIC src)
 

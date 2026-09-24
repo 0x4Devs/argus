@@ -1,6 +1,6 @@
 // Argus — GUI (Qt6 Widgets).
-// v0.2.0: Sortierung, Shell-Icons, Regex/Wildcard-Modes, Files/Folders-Filter,
-//         Keyboard-Shortcuts (Ctrl+F, F5, Esc, Ctrl+C).
+// v0.4.0: Advanced query syntax (ext:/type:/path:/size:/modified:),
+//         multi-drive concurrent indexing ("All Drives").
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -37,7 +37,6 @@
 #include <QTableView>
 #include <QThread>
 #include <QTimer>
-#include <QToolBar>
 #include <QUrl>
 #include <QVBoxLayout>
 
@@ -48,23 +47,22 @@
 #include <thread>
 
 #include "core/index.h"
+#include "core/multi_index.h"
 #include "core/ntfs.h"
+#include "core/query.h"
 #include "core/search.h"
 
 // ================== IconCache ==========================================
-// Windows shell icons per extension via SHGetFileInfoW + SHGFI_USEFILEATTRIBUTES.
-// Cached: an extension only ever hits the shell once.
 
 class IconCache {
 public:
     IconCache() {
-        folder_ = shellIconForPath(L"", true);
+        folder_  = shellIconForPath(L"", true);
         generic_ = shellIconForPath(L"file", false);
     }
 
     QIcon iconFor(std::wstring_view name, bool isDir) {
         if (isDir) return folder_;
-        // Extension aus name extrahieren.
         int dot = -1;
         for (int i = int(name.size()) - 1; i >= 0; --i) {
             if (name[i] == L'.') { dot = i; break; }
@@ -72,7 +70,6 @@ public:
         }
         if (dot < 0 || dot == int(name.size()) - 1) return generic_;
 
-        // Lowercase key.
         QString key;
         key.reserve(int(name.size()) - dot);
         for (int i = dot + 1; i < int(name.size()); ++i) {
@@ -116,19 +113,17 @@ public:
 
     FileModel(QObject* parent = nullptr) : QAbstractTableModel(parent) {}
 
-    void setIndex(const argus::Index* idx) { index_ = idx; }
-    void setIconCache(IconCache* c)        { icons_ = c; }
+    void setMulti(const argus::MultiIndex* m) { multi_ = m; }
+    void setIconCache(IconCache* c)          { icons_ = c; }
 
-    void setResults(std::vector<uint32_t>&& ids) {
+    void setResults(std::vector<argus::SearchHit>&& hits) {
         beginResetModel();
-        results_ = std::move(ids);
+        results_ = std::move(hits);
         applySort();
         endResetModel();
     }
 
-    int rowCount(const QModelIndex& = {}) const override {
-        return int(results_.size());
-    }
+    int rowCount(const QModelIndex& = {}) const override { return int(results_.size()); }
     int columnCount(const QModelIndex& = {}) const override { return ColCount; }
 
     QVariant headerData(int section, Qt::Orientation orient, int role) const override {
@@ -143,31 +138,30 @@ public:
     }
 
     QVariant data(const QModelIndex& mi, int role) const override {
-        if (!index_ || !mi.isValid()) return {};
-        const uint32_t id = results_[mi.row()];
-        const auto& e = index_->entry(id);
+        if (!multi_ || !mi.isValid()) return {};
+        const argus::SearchHit h = results_[mi.row()];
+        const argus::Index& idx = multi_->index(h.drive_slot);
+        const auto& e = idx.entry(h.entry_idx);
 
-        if (role == Qt::DecorationRole && mi.column() == ColName && icons_) {
-            return icons_->iconFor(index_->name(id), index_->is_directory(id));
-        }
+        if (role == Qt::DecorationRole && mi.column() == ColName && icons_)
+            return icons_->iconFor(idx.name(h.entry_idx), idx.is_directory(h.entry_idx));
+
         if (role == Qt::DisplayRole) {
             switch (mi.column()) {
                 case ColName: {
-                    auto sv = index_->name(id);
+                    auto sv = idx.name(h.entry_idx);
                     return QString::fromWCharArray(sv.data(), int(sv.size()));
                 }
                 case ColPath: {
-                    auto p = index_->full_path(id);
+                    auto p = idx.full_path(h.entry_idx);
                     int slash = int(p.size()) - 1;
                     while (slash >= 0 && p[slash] != L'\\') --slash;
-                    if (slash > 0)
-                        return QString::fromWCharArray(p.data(), slash);
+                    if (slash > 0) return QString::fromWCharArray(p.data(), slash);
                     return QString::fromWCharArray(p.data(), int(p.size()));
                 }
-                case ColSize: {
+                case ColSize:
                     if (e.flags & argus::kFlagDirectory) return QVariant();
                     return QLocale::system().formattedDataSize(qint64(e.size));
-                }
                 case ColModified: {
                     if (e.modified_time == 0) return QVariant();
                     const qint64 filetime_epoch_ms = -11644473600000LL;
@@ -176,10 +170,8 @@ public:
                 }
             }
         }
-        if (role == Qt::TextAlignmentRole && mi.column() == ColSize) {
+        if (role == Qt::TextAlignmentRole && mi.column() == ColSize)
             return int(Qt::AlignRight | Qt::AlignVCenter);
-        }
-        if (role == Qt::UserRole) return id;
         return {};
     }
 
@@ -191,21 +183,21 @@ public:
         endResetModel();
     }
 
-    uint32_t entryIdFor(int row) const {
-        if (row < 0 || row >= int(results_.size())) return UINT32_MAX;
+    argus::SearchHit hitAt(int row) const {
+        if (row < 0 || row >= int(results_.size())) return {0xFF, UINT32_MAX};
         return results_[row];
     }
 
 private:
     void applySort() {
-        if (!index_ || results_.empty()) return;
-        const auto& idx = *index_;
+        if (!multi_ || results_.empty()) return;
+        const auto* m = multi_;
         const int col   = sort_column_;
         const bool asc  = (sort_order_ == Qt::AscendingOrder);
 
-        auto cmp = [&](uint32_t a, uint32_t b) -> bool {
-            const auto& ea = idx.entry(a);
-            const auto& eb = idx.entry(b);
+        auto cmp = [&](const argus::SearchHit& a, const argus::SearchHit& b) -> bool {
+            const auto& ea = m->index(a.drive_slot).entry(a.entry_idx);
+            const auto& eb = m->index(b.drive_slot).entry(b.entry_idx);
             switch (col) {
                 case ColSize:
                     if (ea.size != eb.size) return asc ? ea.size < eb.size : ea.size > eb.size;
@@ -216,16 +208,16 @@ private:
                                     : ea.modified_time > eb.modified_time;
                     break;
                 case ColPath: {
-                    auto pa = idx.full_path(a);
-                    auto pb = idx.full_path(b);
+                    auto pa = m->index(a.drive_slot).full_path(a.entry_idx);
+                    auto pb = m->index(b.drive_slot).full_path(b.entry_idx);
                     int c = _wcsicmp(pa.c_str(), pb.c_str());
                     if (c != 0) return asc ? c < 0 : c > 0;
                     break;
                 }
                 case ColName:
                 default: {
-                    auto na = idx.name(a);
-                    auto nb = idx.name(b);
+                    auto na = m->index(a.drive_slot).name(a.entry_idx);
+                    auto nb = m->index(b.drive_slot).name(b.entry_idx);
                     std::wstring wa(na.data(), na.size());
                     std::wstring wb(nb.data(), nb.size());
                     int c = _wcsicmp(wa.c_str(), wb.c_str());
@@ -233,14 +225,15 @@ private:
                     break;
                 }
             }
-            return a < b;
+            return (a.drive_slot != b.drive_slot) ? a.drive_slot < b.drive_slot
+                                                  : a.entry_idx < b.entry_idx;
         };
         std::sort(results_.begin(), results_.end(), cmp);
     }
 
-    const argus::Index* index_ = nullptr;
-    IconCache*          icons_ = nullptr;
-    std::vector<uint32_t> results_;
+    const argus::MultiIndex* multi_ = nullptr;
+    IconCache*               icons_ = nullptr;
+    std::vector<argus::SearchHit> results_;
     int         sort_column_ = -1;
     Qt::SortOrder sort_order_ = Qt::AscendingOrder;
 };
@@ -263,80 +256,71 @@ private slots:
     void onModeChanged(int);
     void onFilterChanged(int);
     void copySelectedPaths();
+    void pollUsn();
 
 private:
     void startScan();
-    void openInExplorer(uint32_t id);
-    void openFile(uint32_t id);
+    void loadOrScan();
+    void openInExplorer(const argus::SearchHit&);
+    void openFile(const argus::SearchHit&);
     void updateStatusReady();
+    std::vector<wchar_t> selectedDrives() const;
+    std::vector<wchar_t> availableDrives() const;
 
-    // Toolbar
     QLineEdit*    search_;
     QComboBox*    drive_combo_;
     QComboBox*    mode_combo_;
     QComboBox*    filter_combo_;
-
-    // Table
     QTableView*   table_;
     FileModel*    model_;
     IconCache     icon_cache_;
-
-    // Statusbar
     QLabel*       status_left_;
+    QLabel*       hint_;
     QProgressBar* progress_;
-
     QTimer*       poll_timer_;
     QTimer*       debounce_;
     QTimer*       usn_timer_;
 
-    argus::Index index_;
-    argus::Index::ScanStats stats_;
+    argus::MultiIndex          multi_;
+    argus::MultiIndex::AggregateStats stats_;
     std::thread scan_thread_;
     std::atomic<bool> scan_cancelled_{false};
-
-    void pollUsn();
-    void loadOrScan();
+    std::vector<wchar_t> avail_;  // populated in ctor
 };
 
 MainWindow::MainWindow() {
     setWindowTitle("Argus — Instant File Search");
-    resize(1180, 720);
+    resize(1220, 720);
 
     if (QStyleFactory::keys().contains("windows11", Qt::CaseInsensitive))
         QApplication::setStyle(QStyleFactory::create("windows11"));
 
-    // -------- Toolbar (drive + search + mode + filter) --------
+    // -------- Discover NTFS drives --------
+    avail_ = availableDrives();
+
+    // -------- Toolbar --------
     auto* central = new QWidget();
     setCentralWidget(central);
     auto* v = new QVBoxLayout(central);
     v->setContentsMargins(10, 10, 10, 6);
-    v->setSpacing(8);
+    v->setSpacing(6);
 
     auto* head = new QHBoxLayout();
     head->setSpacing(8);
 
     drive_combo_ = new QComboBox();
-    DWORD mask = GetLogicalDrives();
-    for (int i = 0; i < 26; ++i) {
-        if (!(mask & (1u << i))) continue;
-        wchar_t root[] = { wchar_t(L'A' + i), L':', L'\\', 0 };
-        if (GetDriveTypeW(root) != DRIVE_FIXED) continue;
-        wchar_t fs[16] = {0};
-        if (!GetVolumeInformationW(root, nullptr, 0, nullptr, nullptr, nullptr, fs, 16)) continue;
-        if (wcscmp(fs, L"NTFS") != 0) continue;
-        drive_combo_->addItem(QString(QChar(L'A' + i)) + ":");
-    }
-    if (drive_combo_->count() == 0) drive_combo_->addItem("C:");
-    drive_combo_->setFixedWidth(80);
+    drive_combo_->addItem("All Drives");
+    for (wchar_t d : avail_) drive_combo_->addItem(QString(QChar(d)) + ":");
+    drive_combo_->setFixedWidth(120);
 
     search_ = new QLineEdit();
-    search_->setPlaceholderText("Search — type any part of a name…");
+    search_->setPlaceholderText("Search — name, or use ext:pdf size:>10MB modified:<7d …");
     search_->setClearButtonEnabled(true);
     search_->setEnabled(false);
 
     mode_combo_ = new QComboBox();
-    mode_combo_->addItem("Text");       // Substring
-    mode_combo_->addItem("Wildcard");   // *.mp4
+    mode_combo_->addItem("Text");
+    mode_combo_->addItem("Wildcard");
     mode_combo_->addItem("Regex");
     mode_combo_->setFixedWidth(100);
 
@@ -352,10 +336,16 @@ MainWindow::MainWindow() {
     head->addWidget(filter_combo_);
     v->addLayout(head);
 
+    // Query syntax hint (dim, single line).
+    hint_ = new QLabel("Hints:  ext:pdf   type:image|video|audio|document|archive|code   "
+                       "size:>100MB   modified:<7d   path:downloads   !exclude");
+    hint_->setStyleSheet("color: palette(mid); font-size: 11px;");
+    v->addWidget(hint_);
+
     // -------- Table --------
     table_ = new QTableView();
     model_ = new FileModel(this);
-    model_->setIndex(&index_);
+    model_->setMulti(&multi_);
     model_->setIconCache(&icon_cache_);
     table_->setModel(model_);
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -380,7 +370,7 @@ MainWindow::MainWindow() {
     progress_ = new QProgressBar();
     progress_->setRange(0, 100);
     progress_->setValue(0);
-    progress_->setFixedWidth(200);
+    progress_->setFixedWidth(220);
     progress_->setTextVisible(true);
     progress_->hide();
     statusBar()->addWidget(status_left_, 1);
@@ -396,7 +386,6 @@ MainWindow::MainWindow() {
     poll_timer_->setInterval(80);
     connect(poll_timer_, &QTimer::timeout, this, &MainWindow::pollScan);
 
-    // USN Journal polling — sammelt Live-Aenderungen alle 700 ms.
     usn_timer_ = new QTimer(this);
     usn_timer_->setInterval(700);
     connect(usn_timer_, &QTimer::timeout, this, &MainWindow::pollUsn);
@@ -413,88 +402,100 @@ MainWindow::MainWindow() {
     connect(filter_combo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &MainWindow::onFilterChanged);
 
-    // -------- Keyboard shortcuts --------
-    // Ctrl+F: Focus + select-all search box.
     auto* sc_find = new QShortcut(QKeySequence("Ctrl+F"), this);
     connect(sc_find, &QShortcut::activated, this, [this]{
         search_->setFocus();
         search_->selectAll();
     });
-    // F5: rescan current drive.
     auto* sc_rescan = new QShortcut(QKeySequence("F5"), this);
     connect(sc_rescan, &QShortcut::activated, this, &MainWindow::startScan);
-    // Esc while search box has focus: clear.
     auto* sc_esc = new QShortcut(QKeySequence("Escape"), this);
     connect(sc_esc, &QShortcut::activated, this, [this]{
         if (search_->hasFocus() && !search_->text().isEmpty()) search_->clear();
     });
-    // Ctrl+C on table selection: copy full path(s).
     auto* sc_copy = new QShortcut(QKeySequence::Copy, table_);
     sc_copy->setContext(Qt::WidgetShortcut);
     connect(sc_copy, &QShortcut::activated, this, &MainWindow::copySelectedPaths);
 
+    // Start scan (persistent cache path only makes sense for single drive).
     loadOrScan();
 }
 
 MainWindow::~MainWindow() {
     scan_cancelled_.store(true);
     if (scan_thread_.joinable()) scan_thread_.join();
-    // Aktuellen Index speichern falls sinnvoll.
-    if (index_.entry_count() > 0) {
-        auto cache = argus::CacheFilePath(drive_combo_->currentText().at(0).toUpper().unicode());
-        if (!cache.empty()) index_.SaveTo(cache);
+    // Cache jeden Index einzeln.
+    for (size_t i = 0; i < multi_.drive_count(); ++i) {
+        auto path = argus::CacheFilePath(multi_.drive_letter(i));
+        if (!path.empty() && multi_.index(i).entry_count() > 0)
+            multi_.index(i).SaveTo(path);
     }
 }
 
-// Versucht zuerst aus dem Cache zu laden. Klappt das + Volume-Serial passt,
-// nur ein schneller USN-Catch-up. Sonst voller Scan.
+// ---------- Drive discovery ----------
+
+std::vector<wchar_t> MainWindow::availableDrives() const {
+    std::vector<wchar_t> out;
+    DWORD mask = GetLogicalDrives();
+    for (int i = 0; i < 26; ++i) {
+        if (!(mask & (1u << i))) continue;
+        wchar_t root[] = { wchar_t(L'A' + i), L':', L'\\', 0 };
+        if (GetDriveTypeW(root) != DRIVE_FIXED) continue;
+        wchar_t fs[16] = {0};
+        if (!GetVolumeInformationW(root, nullptr, 0, nullptr, nullptr, nullptr, fs, 16)) continue;
+        if (wcscmp(fs, L"NTFS") != 0) continue;
+        out.push_back(wchar_t(L'A' + i));
+    }
+    return out;
+}
+
+std::vector<wchar_t> MainWindow::selectedDrives() const {
+    if (drive_combo_->currentIndex() == 0) return avail_;
+    QString t = drive_combo_->currentText();
+    if (t.isEmpty()) return avail_;
+    return { wchar_t(t.at(0).toUpper().unicode()) };
+}
+
+// ---------- Scan / Load ----------
+
 void MainWindow::loadOrScan() {
-    wchar_t drive = drive_combo_->currentText().at(0).toUpper().unicode();
-    auto cache_path = argus::CacheFilePath(drive);
-    if (cache_path.empty()) { startScan(); return; }
-
-    if (!index_.LoadFrom(cache_path)) { startScan(); return; }
-
-    // Volume-Serial gegen aktuelles Volume abgleichen.
-    wchar_t path[16];
-    swprintf(path, 16, L"\\\\.\\%c:", drive);
-    HANDLE h = CreateFileW(path, GENERIC_READ,
-                          FILE_SHARE_READ | FILE_SHARE_WRITE,
-                          nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) { startScan(); return; }
-    argus::ntfs::BootSector bs{};
-    LARGE_INTEGER zero{}; zero.QuadPart = 0;
-    SetFilePointerEx(h, zero, nullptr, FILE_BEGIN);
-    DWORD got = 0;
-    ReadFile(h, &bs, sizeof(bs), &got, nullptr);
-    CloseHandle(h);
-    if (got != sizeof(bs) || bs.volume_serial != index_.volume_serial()) {
-        startScan();
+    auto drives = selectedDrives();
+    if (drives.empty()) {
+        status_left_->setText("No NTFS drives found.");
         return;
     }
-
-    // Cache ist gueltig — USN-Catch-up laufen lassen und weiter.
-    auto st = index_.ApplyUsnChanges();
-    if (st.rolled_over) { startScan(); return; }
-
-    search_->setEnabled(true);
-    search_->setFocus();
-    updateStatusReady();
-    usn_timer_->start();
-}
-
-void MainWindow::pollUsn() {
-    if (index_.entry_count() == 0) return;
-    auto st = index_.ApplyUsnChanges();
-    if (st.rolled_over) {
-        usn_timer_->stop();
-        startScan();
+    multi_.SetDrives(drives);
+    bool all_loaded = true;
+    for (size_t i = 0; i < multi_.drive_count(); ++i) {
+        wchar_t d = multi_.drive_letter(i);
+        auto path = argus::CacheFilePath(d);
+        if (path.empty() || !multi_.index(i).LoadFrom(path)) { all_loaded = false; continue; }
+        // Volume-Serial abgleichen.
+        wchar_t p[16]; swprintf(p, 16, L"\\\\.\\%c:", d);
+        HANDLE h = CreateFileW(p, GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) { all_loaded = false; continue; }
+        argus::ntfs::BootSector bs{};
+        LARGE_INTEGER zero{}; zero.QuadPart = 0;
+        SetFilePointerEx(h, zero, nullptr, FILE_BEGIN);
+        DWORD got = 0;
+        ReadFile(h, &bs, sizeof(bs), &got, nullptr);
+        CloseHandle(h);
+        if (got != sizeof(bs) || bs.volume_serial != multi_.index(i).volume_serial()) {
+            all_loaded = false;
+        }
+    }
+    if (all_loaded) {
+        auto st = multi_.ApplyUsnChanges();
+        if (st.any_rolled_over) { startScan(); return; }
+        search_->setEnabled(true);
+        search_->setFocus();
+        updateStatusReady();
+        usn_timer_->start();
         return;
     }
-    if (st.added || st.renamed || st.deleted) {
-        // Nur Aenderungen neu suchen falls Suchfeld befuellt.
-        if (!search_->text().isEmpty()) runSearch();
-    }
+    startScan();
 }
 
 void MainWindow::startScan() {
@@ -502,25 +503,24 @@ void MainWindow::startScan() {
     if (scan_thread_.joinable()) scan_thread_.join();
     usn_timer_->stop();
 
-    scan_cancelled_.store(false);
+    auto drives = selectedDrives();
+    multi_.SetDrives(drives);
+
     stats_.records_seen.store(0);
     stats_.total_records.store(0);
     stats_.entries.store(0);
     stats_.bytes_read.store(0);
+    stats_.drives_done.store(0);
+    stats_.drives_total.store(uint32_t(drives.size()));
     stats_.done.store(false);
-    stats_.ok.store(false);
     model_->setResults({});
-
-    wchar_t drive = drive_combo_->currentText().at(0).toUpper().unicode();
 
     search_->setEnabled(false);
     progress_->show();
     progress_->setValue(0);
-    status_left_->setText(QString("Indexing %1: …").arg(drive_combo_->currentText()));
+    status_left_->setText(QString("Indexing %L1 drive(s)…").arg(int(drives.size())));
 
-    scan_thread_ = std::thread([this, drive]{
-        index_.ScanDrive(drive, &stats_);
-    });
+    scan_thread_ = std::thread([this]{ multi_.ScanAll(&stats_); });
     poll_timer_->start();
 }
 
@@ -528,55 +528,51 @@ void MainWindow::pollScan() {
     const uint64_t total = stats_.total_records.load();
     const uint64_t seen  = stats_.records_seen.load();
     const uint64_t ents  = stats_.entries.load();
+    const uint32_t dd    = stats_.drives_done.load();
+    const uint32_t dt    = stats_.drives_total.load();
 
     if (total > 0) {
         int pct = int(seen * 100 / total);
         progress_->setValue(pct);
-        status_left_->setText(QString("Indexing %1: … %L2 / %L3 records — %L4 entries")
-                              .arg(drive_combo_->currentText())
-                              .arg(qulonglong(seen))
-                              .arg(qulonglong(total))
-                              .arg(qulonglong(ents)));
+        status_left_->setText(QString("Indexing (%1/%2 drives): %L3 / %L4 records — %L5 entries")
+                              .arg(dd).arg(dt)
+                              .arg(qulonglong(seen)).arg(qulonglong(total)).arg(qulonglong(ents)));
     }
 
     if (stats_.done.load()) {
         poll_timer_->stop();
         if (scan_thread_.joinable()) scan_thread_.join();
-
-        if (!stats_.ok.load()) {
-            progress_->hide();
-            status_left_->setText("MFT read failed — is Argus running as Administrator?");
-            QMessageBox::warning(this, "Argus",
-                "Could not read the MFT.\n\n"
-                "Please make sure Argus was started as Administrator. "
-                "Raw NTFS access requires elevated privileges.");
-            return;
-        }
         progress_->hide();
         search_->setEnabled(true);
         search_->setFocus();
         updateStatusReady();
-        runSearch();  // update view if query already present
+        runSearch();
 
-        // Nach jedem erfolgreichen Scan Cache schreiben und USN-Polling starten.
-        auto cache = argus::CacheFilePath(drive_combo_->currentText().at(0).toUpper().unicode());
-        if (!cache.empty()) index_.SaveTo(cache);
+        // Cache jeden Drive.
+        for (size_t i = 0; i < multi_.drive_count(); ++i) {
+            auto path = argus::CacheFilePath(multi_.drive_letter(i));
+            if (!path.empty()) multi_.index(i).SaveTo(path);
+        }
         usn_timer_->start();
     }
 }
 
 void MainWindow::updateStatusReady() {
-    status_left_->setText(QString("Ready — %L1 entries on %2")
-        .arg(qulonglong(index_.entry_count()))
-        .arg(drive_combo_->currentText()));
+    QString drives_txt;
+    if (multi_.drive_count() == 1) {
+        drives_txt = QString(QChar(multi_.drive_letter(0))) + ":";
+    } else {
+        drives_txt = QString("%1 NTFS volumes").arg(int(multi_.drive_count()));
+    }
+    status_left_->setText(QString("Ready — %L1 entries across %2")
+        .arg(qulonglong(multi_.total_entries())).arg(drives_txt));
 }
 
-void MainWindow::onSearchTextChanged() {
-    debounce_->start();
-}
+// ---------- Search ----------
 
-void MainWindow::onModeChanged(int)   { debounce_->start(); }
-void MainWindow::onFilterChanged(int) { debounce_->start(); }
+void MainWindow::onSearchTextChanged() { debounce_->start(); }
+void MainWindow::onModeChanged(int)     { debounce_->start(); }
+void MainWindow::onFilterChanged(int)   { debounce_->start(); }
 
 void MainWindow::runSearch() {
     const QString qtext = search_->text();
@@ -585,50 +581,98 @@ void MainWindow::runSearch() {
         updateStatusReady();
         return;
     }
-    std::wstring q = qtext.toStdWString();
+
+    std::wstring raw = qtext.toStdWString();
+    argus::SearchMode mode = static_cast<argus::SearchMode>(mode_combo_->currentIndex());
+
+    // Trenne Name-Teil (Tokens ohne ':') vom Advanced-Query-Teil (mit ':')
+    // — nur im Text-Modus. Bei Wildcard/Regex bleibt der komplette String der
+    // Pattern und Advanced-Query wird nicht extra angewendet.
+    std::wstring name_part;
+    std::wstring adv_part;
+    if (mode == argus::SearchMode::Substring) {
+        // Naiv aufteilen: alles was `field:value` oder `!field:value` oder `!wort` ist,
+        // geht in adv_part; Rest in name_part (durch Leerzeichen getrennt).
+        size_t i = 0;
+        while (i < raw.size()) {
+            while (i < raw.size() && iswspace(raw[i])) ++i;
+            if (i >= raw.size()) break;
+            size_t s = i;
+            while (i < raw.size() && !iswspace(raw[i])) ++i;
+            std::wstring_view tok(raw.data() + s, i - s);
+            bool has_colon = tok.find(L':') != std::wstring_view::npos;
+            bool has_bang  = !tok.empty() && tok.front() == L'!';
+            if (has_colon || has_bang) {
+                if (!adv_part.empty()) adv_part.push_back(L' ');
+                adv_part.append(tok);
+            } else {
+                if (!name_part.empty()) name_part.push_back(L' ');
+                name_part.append(tok);
+            }
+        }
+    } else {
+        name_part = raw;
+    }
+
+    argus::Query adv = argus::ParseQuery(adv_part);
+
     argus::SearchOptions opt;
-    opt.max_results = 10000;
-    opt.mode = static_cast<argus::SearchMode>(mode_combo_->currentIndex());
+    opt.max_results = 20000;
+    opt.mode = mode;
     if (filter_combo_->currentIndex() == 1) opt.files_only = true;
     if (filter_combo_->currentIndex() == 2) opt.dirs_only  = true;
+    opt.advanced_query = adv.empty() ? nullptr : &adv;
 
+    std::vector<argus::SearchHit> hits;
     auto t0 = std::chrono::steady_clock::now();
-    auto ids = argus::Search(index_, q, opt);
+    size_t max_per = std::max<size_t>(1, opt.max_results / std::max<size_t>(1, multi_.drive_count()));
+    for (size_t slot = 0; slot < multi_.drive_count(); ++slot) {
+        argus::SearchOptions o = opt;
+        o.max_results = max_per;
+        auto ids = argus::Search(multi_.index(slot), name_part, o);
+        for (uint32_t id : ids) {
+            hits.push_back({uint8_t(slot), id});
+            if (hits.size() >= opt.max_results) break;
+        }
+        if (hits.size() >= opt.max_results) break;
+    }
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-    const size_t total_hits = ids.size();
-    model_->setResults(std::move(ids));
-    status_left_->setText(QString("%L1 hits  (%2 ms)")
-        .arg(qulonglong(total_hits))
-        .arg(QString::number(ms, 'f', 1)));
+    size_t total = hits.size();
+    model_->setResults(std::move(hits));
+    status_left_->setText(QString("%L1 hits  (%2 ms across %L3 entries)")
+        .arg(qulonglong(total)).arg(QString::number(ms, 'f', 1))
+        .arg(qulonglong(multi_.total_entries())));
 }
 
+// ---------- Interaction ----------
+
 void MainWindow::onActivated(const QModelIndex& mi) {
-    uint32_t id = model_->entryIdFor(mi.row());
-    if (id == UINT32_MAX) return;
-    if (index_.is_directory(id)) openInExplorer(id);
-    else                         openFile(id);
+    argus::SearchHit h = model_->hitAt(mi.row());
+    if (h.entry_idx == UINT32_MAX) return;
+    if (multi_.index(h.drive_slot).is_directory(h.entry_idx)) openInExplorer(h);
+    else                                                     openFile(h);
 }
 
 void MainWindow::onContextMenu(const QPoint& pos) {
     QModelIndex mi = table_->indexAt(pos);
     if (!mi.isValid()) return;
-    uint32_t id = model_->entryIdFor(mi.row());
-    if (id == UINT32_MAX) return;
+    argus::SearchHit h = model_->hitAt(mi.row());
+    if (h.entry_idx == UINT32_MAX) return;
+    bool is_dir = multi_.index(h.drive_slot).is_directory(h.entry_idx);
 
     QMenu menu(this);
-    auto* aOpen = menu.addAction(index_.is_directory(id) ? "Open folder" : "Open file");
+    auto* aOpen = menu.addAction(is_dir ? "Open folder" : "Open file");
     auto* aReveal = menu.addAction("Reveal in Explorer");
     menu.addSeparator();
     auto* aCopyPath = menu.addAction("Copy path");
     QAction* chosen = menu.exec(table_->viewport()->mapToGlobal(pos));
 
     if (chosen == aOpen) {
-        if (index_.is_directory(id)) openInExplorer(id);
-        else                         openFile(id);
+        if (is_dir) openInExplorer(h); else openFile(h);
     } else if (chosen == aReveal) {
-        auto path = index_.full_path(id);
+        auto path = multi_.index(h.drive_slot).full_path(h.entry_idx);
         QString qpath = QString::fromWCharArray(path.data(), int(path.size()));
         QString param = "/select,\"" + QDir::toNativeSeparators(qpath) + "\"";
         ShellExecuteW(nullptr, L"open", L"explorer.exe",
@@ -639,32 +683,35 @@ void MainWindow::onContextMenu(const QPoint& pos) {
     }
 }
 
-void MainWindow::openInExplorer(uint32_t id) {
-    auto path = index_.full_path(id);
+void MainWindow::openInExplorer(const argus::SearchHit& h) {
+    auto path = multi_.index(h.drive_slot).full_path(h.entry_idx);
     QDesktopServices::openUrl(QUrl::fromLocalFile(
         QString::fromWCharArray(path.data(), int(path.size()))));
 }
-
-void MainWindow::openFile(uint32_t id) {
-    auto path = index_.full_path(id);
-    QDesktopServices::openUrl(QUrl::fromLocalFile(
-        QString::fromWCharArray(path.data(), int(path.size()))));
-}
+void MainWindow::openFile(const argus::SearchHit& h) { openInExplorer(h); }
 
 void MainWindow::copySelectedPaths() {
     auto sel = table_->selectionModel()->selectedRows();
     if (sel.isEmpty()) return;
     QStringList lines;
     for (const auto& mi : sel) {
-        uint32_t id = model_->entryIdFor(mi.row());
-        if (id == UINT32_MAX) continue;
-        auto p = index_.full_path(id);
+        argus::SearchHit h = model_->hitAt(mi.row());
+        if (h.entry_idx == UINT32_MAX) continue;
+        auto p = multi_.index(h.drive_slot).full_path(h.entry_idx);
         lines << QString::fromWCharArray(p.data(), int(p.size()));
     }
     QApplication::clipboard()->setText(lines.join("\n"));
 }
 
 void MainWindow::onDriveChanged(int) { loadOrScan(); }
+
+void MainWindow::pollUsn() {
+    if (multi_.total_entries() == 0) return;
+    auto st = multi_.ApplyUsnChanges();
+    if (st.any_rolled_over) { usn_timer_->stop(); startScan(); return; }
+    if ((st.added || st.renamed || st.deleted) && !search_->text().isEmpty())
+        runSearch();
+}
 
 // ================== Entry ================================================
 

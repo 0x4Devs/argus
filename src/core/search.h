@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "core/index.h"
+#include "core/query.h"
 
 namespace argus {
 
@@ -23,6 +24,9 @@ struct SearchOptions {
     bool       files_only  = false;
     bool       dirs_only   = false;
     SearchMode mode        = SearchMode::Substring;
+    // Wenn gesetzt, wird die Advanced-Query zusaetzlich zum Text-Match evaluiert.
+    // Der Name-Teil im Text-Pfad matched trotzdem im normalen Modus.
+    const Query* advanced_query = nullptr;
 };
 
 std::vector<uint32_t> Search(const Index& index,
