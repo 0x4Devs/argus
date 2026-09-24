@@ -40,10 +40,19 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFormLayout>
+#include <QMenuBar>
+#include <QMetaObject>
+#include <QMutex>
 #include <QPlainTextEdit>
+#include <QPushButton>
 #include <QTableWidget>
+#include <QTreeWidget>
+#include <QTreeWidgetItem>
 #include <QUrl>
 #include <QVBoxLayout>
+
+#include <mutex>
+#include <unordered_map>
 
 #include <algorithm>
 #include <atomic>
@@ -166,6 +175,214 @@ public:
         connect(bb, &QDialogButtonBox::rejected, this, &QDialog::reject);
         root->addWidget(bb);
     }
+};
+
+// ================== DuplicateFinderDialog ==============================
+// Background pipeline: 1) group by exact size, 2) drop singletons, 3) hash the
+// first 64 KB of each candidate with FNV-1a and sub-group. Cheap, no crypto —
+// good enough for a media-vs-source drive; a v0.7 could add full-file hash.
+
+class DuplicateFinderDialog : public QDialog {
+    Q_OBJECT
+public:
+    DuplicateFinderDialog(const argus::MultiIndex* multi, QWidget* parent = nullptr)
+        : QDialog(parent), multi_(multi) {
+        setWindowTitle("Find duplicates");
+        resize(880, 580);
+
+        auto* root = new QVBoxLayout(this);
+        root->setContentsMargins(14, 12, 14, 10);
+
+        progress_ = new QProgressBar();
+        progress_->setRange(0, 100);
+        progress_->setValue(0);
+        summary_ = new QLabel("Scanning…");
+        root->addWidget(summary_);
+        root->addWidget(progress_);
+
+        tree_ = new QTreeWidget();
+        tree_->setColumnCount(3);
+        tree_->setHeaderLabels({"File", "Size", "Path"});
+        tree_->setAlternatingRowColors(true);
+        tree_->header()->setStretchLastSection(true);
+        tree_->setColumnWidth(0, 260);
+        tree_->setColumnWidth(1, 100);
+        root->addWidget(tree_, 1);
+
+        auto* btns = new QDialogButtonBox();
+        cancel_btn_ = btns->addButton("Cancel", QDialogButtonBox::RejectRole);
+        auto* close = btns->addButton("Close", QDialogButtonBox::AcceptRole);
+        connect(cancel_btn_, &QPushButton::clicked, this, [this]{
+            cancelled_.store(true);
+            summary_->setText("Cancelling…");
+        });
+        connect(close, &QPushButton::clicked, this, &QDialog::accept);
+        root->addWidget(btns);
+
+        worker_ = std::thread([this]{ runScan(); });
+    }
+
+    ~DuplicateFinderDialog() {
+        cancelled_.store(true);
+        if (worker_.joinable()) worker_.join();
+    }
+
+signals:
+    void statusUpdate(int pct, quint64 groups, quint64 wasted);
+    void done();
+
+private:
+    static uint64_t fnv1a(const uint8_t* data, size_t n) {
+        uint64_t h = 14695981039346656037ULL;
+        for (size_t i = 0; i < n; ++i) {
+            h ^= data[i];
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+    void runScan() {
+        connect(this, &DuplicateFinderDialog::statusUpdate, this,
+            [this](int pct, quint64 groups, quint64 wasted){
+                progress_->setValue(pct);
+                summary_->setText(QString("%L1 duplicate group(s) — %2 recoverable")
+                    .arg(groups).arg(QLocale::system().formattedDataSize(qint64(wasted))));
+            }, Qt::QueuedConnection);
+        connect(this, &DuplicateFinderDialog::done, this, [this]{
+            cancel_btn_->setEnabled(false);
+            populateTree();
+        }, Qt::QueuedConnection);
+
+        // Phase 1: bucket by size.
+        std::unordered_map<uint64_t, std::vector<argus::SearchHit>> by_size;
+        by_size.reserve(200000);
+        uint64_t total_entries = 0;
+        for (size_t slot = 0; slot < multi_->drive_count(); ++slot)
+            total_entries += multi_->index(slot).entry_count();
+        uint64_t seen = 0;
+        for (size_t slot = 0; slot < multi_->drive_count(); ++slot) {
+            const auto& idx = multi_->index(slot);
+            const auto& es = idx.entries();
+            for (uint32_t i = 0; i < es.size(); ++i) {
+                if (cancelled_.load()) return;
+                const auto& e = es[i];
+                if (e.flags & (argus::kFlagDirectory | argus::kFlagDeleted)) continue;
+                if (e.size == 0) continue;
+                by_size[e.size].push_back({uint8_t(slot), i});
+                if (((++seen) & 0x1FFFF) == 0) {
+                    int pct = int(seen * 30 / std::max<uint64_t>(1, total_entries));
+                    emit statusUpdate(pct, 0, 0);
+                }
+            }
+        }
+
+        // Phase 2: hash first 64 KB of each file in groups with more than one.
+        std::vector<uint8_t> buf(65536);
+        std::vector<std::pair<uint64_t, std::vector<argus::SearchHit>>> candidate_groups;
+        for (auto& kv : by_size) {
+            if (cancelled_.load()) return;
+            if (kv.second.size() < 2) continue;
+            candidate_groups.emplace_back(std::move(kv));
+        }
+        by_size.clear();
+
+        uint64_t groups_found = 0, wasted = 0;
+        uint64_t processed_files = 0;
+        uint64_t total_candidate_files = 0;
+        for (auto& g : candidate_groups) total_candidate_files += g.second.size();
+
+        {
+            std::lock_guard<std::mutex> lk(found_mtx_);
+            found_.clear();
+        }
+
+        for (auto& g : candidate_groups) {
+            if (cancelled_.load()) return;
+            std::unordered_map<uint64_t, std::vector<argus::SearchHit>> by_hash;
+            for (const auto& hit : g.second) {
+                if (cancelled_.load()) return;
+                const argus::Index& idx = multi_->index(hit.drive_slot);
+                std::wstring path = idx.full_path(hit.entry_idx);
+                HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                      nullptr, OPEN_EXISTING,
+                                      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                                      nullptr);
+                if (h == INVALID_HANDLE_VALUE) { ++processed_files; continue; }
+                DWORD got = 0;
+                DWORD to_read = DWORD(std::min<uint64_t>(g.first, buf.size()));
+                BOOL ok = ReadFile(h, buf.data(), to_read, &got, nullptr);
+                CloseHandle(h);
+                if (!ok) { ++processed_files; continue; }
+                uint64_t hh = fnv1a(buf.data(), got);
+                by_hash[hh].push_back(hit);
+                ++processed_files;
+                if ((processed_files & 0x1FF) == 0) {
+                    int pct = 30 + int(processed_files * 70 /
+                        std::max<uint64_t>(1, total_candidate_files));
+                    emit statusUpdate(pct, groups_found, wasted);
+                }
+            }
+            for (auto& hk : by_hash) {
+                if (hk.second.size() < 2) continue;
+                DupGroup dg;
+                dg.size = g.first;
+                dg.hash = hk.first;
+                dg.files = std::move(hk.second);
+                wasted += g.first * (dg.files.size() - 1);
+                ++groups_found;
+                std::lock_guard<std::mutex> lk(found_mtx_);
+                found_.push_back(std::move(dg));
+            }
+            emit statusUpdate(std::min(99, int(30 + processed_files * 70 /
+                                        std::max<uint64_t>(1, total_candidate_files))),
+                              groups_found, wasted);
+        }
+        emit statusUpdate(100, groups_found, wasted);
+        emit done();
+    }
+
+    void populateTree() {
+        std::lock_guard<std::mutex> lk(found_mtx_);
+        tree_->clear();
+        // Nach Groesse absteigend sortieren damit die groessten Duplikate zuerst kommen.
+        std::sort(found_.begin(), found_.end(),
+                  [](const DupGroup& a, const DupGroup& b){
+                      return a.size * a.files.size() > b.size * b.files.size();
+                  });
+        for (auto& g : found_) {
+            auto* top = new QTreeWidgetItem(tree_);
+            top->setText(0, QString("%1 duplicates").arg(g.files.size()));
+            top->setText(1, QLocale::system().formattedDataSize(qint64(g.size)));
+            top->setText(2, QString("wastes %1")
+                .arg(QLocale::system().formattedDataSize(qint64(g.size * (g.files.size() - 1)))));
+            for (const auto& hit : g.files) {
+                const argus::Index& idx = multi_->index(hit.drive_slot);
+                auto name = idx.name(hit.entry_idx);
+                auto path = idx.full_path(hit.entry_idx);
+                auto* child = new QTreeWidgetItem(top);
+                child->setText(0, QString::fromWCharArray(name.data(), int(name.size())));
+                child->setText(1, "");
+                child->setText(2, QString::fromWCharArray(path.data(), int(path.size())));
+            }
+        }
+    }
+
+    struct DupGroup {
+        uint64_t size;
+        uint64_t hash;
+        std::vector<argus::SearchHit> files;
+    };
+
+    const argus::MultiIndex* multi_;
+    QTreeWidget*   tree_;
+    QProgressBar*  progress_;
+    QLabel*        summary_;
+    QPushButton*   cancel_btn_;
+    std::thread    worker_;
+    std::atomic<bool> cancelled_{false};
+    std::vector<DupGroup> found_;
+    std::mutex     found_mtx_;
 };
 
 // ================== IconCache ==========================================
@@ -438,6 +655,7 @@ MainWindow::MainWindow() {
     mode_combo_->addItem("Text");
     mode_combo_->addItem("Wildcard");
     mode_combo_->addItem("Regex");
+    mode_combo_->addItem("Fuzzy");
     mode_combo_->setFixedWidth(100);
 
     filter_combo_ = new QComboBox();
@@ -533,7 +751,95 @@ MainWindow::MainWindow() {
     sc_copy->setContext(Qt::WidgetShortcut);
     connect(sc_copy, &QShortcut::activated, this, &MainWindow::copySelectedPaths);
 
-    // Start scan (persistent cache path only makes sense for single drive).
+    // Ctrl+Enter -> open containing folder for the selected row.
+    auto* sc_reveal = new QShortcut(QKeySequence("Ctrl+Return"), this);
+    connect(sc_reveal, &QShortcut::activated, this, [this]{
+        auto sel = table_->selectionModel()->selectedRows();
+        if (sel.isEmpty()) return;
+        argus::SearchHit h = model_->hitAt(sel.first().row());
+        if (h.entry_idx == UINT32_MAX) return;
+        auto path = multi_.index(h.drive_slot).full_path(h.entry_idx);
+        QString qpath = QString::fromWCharArray(path.data(), int(path.size()));
+        QString param = "/select,\"" + QDir::toNativeSeparators(qpath) + "\"";
+        ShellExecuteW(nullptr, L"open", L"explorer.exe",
+                      reinterpret_cast<LPCWSTR>(param.utf16()),
+                      nullptr, SW_SHOWNORMAL);
+    });
+
+    // Alt+Enter -> shell Properties dialog.
+    auto* sc_props = new QShortcut(QKeySequence("Alt+Return"), this);
+    connect(sc_props, &QShortcut::activated, this, [this]{
+        auto sel = table_->selectionModel()->selectedRows();
+        if (sel.isEmpty()) return;
+        argus::SearchHit h = model_->hitAt(sel.first().row());
+        if (h.entry_idx == UINT32_MAX) return;
+        auto path = multi_.index(h.drive_slot).full_path(h.entry_idx);
+        SHELLEXECUTEINFOW sei{};
+        sei.cbSize = sizeof(sei);
+        sei.fMask  = SEE_MASK_INVOKEIDLIST;
+        sei.lpVerb = L"properties";
+        sei.lpFile = path.c_str();
+        sei.nShow  = SW_SHOWNORMAL;
+        ShellExecuteExW(&sei);
+    });
+
+    // Delete -> move to recycle bin (with confirmation).
+    auto* sc_del = new QShortcut(QKeySequence("Delete"), table_);
+    sc_del->setContext(Qt::WidgetShortcut);
+    connect(sc_del, &QShortcut::activated, this, [this]{
+        auto sel = table_->selectionModel()->selectedRows();
+        if (sel.isEmpty()) return;
+        // Doppel-Null-terminierte Liste fuer SHFileOperation aufbauen.
+        std::wstring buf;
+        int cnt = 0;
+        for (const auto& mi : sel) {
+            argus::SearchHit h = model_->hitAt(mi.row());
+            if (h.entry_idx == UINT32_MAX) continue;
+            buf.append(multi_.index(h.drive_slot).full_path(h.entry_idx));
+            buf.push_back(L'\0');
+            ++cnt;
+        }
+        buf.push_back(L'\0');
+        if (QMessageBox::question(this, "Move to Recycle Bin",
+                QString("Move %1 item(s) to the Recycle Bin?").arg(cnt))
+                != QMessageBox::Yes)
+            return;
+        SHFILEOPSTRUCTW op{};
+        op.hwnd   = HWND(winId());
+        op.wFunc  = FO_DELETE;
+        op.pFrom  = buf.c_str();
+        op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+        SHFileOperationW(&op);
+    });
+
+    // Menu bar with Tools -> Find duplicates.
+    auto* toolsMenu = menuBar()->addMenu("Tools");
+    auto* aDup = toolsMenu->addAction("Find duplicates…");
+    connect(aDup, &QAction::triggered, this, [this]{
+        if (multi_.total_entries() == 0) {
+            QMessageBox::information(this, "Argus",
+                "Wait until indexing is done before running the duplicate finder.");
+            return;
+        }
+        auto* dlg = new DuplicateFinderDialog(&multi_, this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+    });
+    auto* aRescan = toolsMenu->addAction("Re-scan current drive(s)\tF5");
+    connect(aRescan, &QAction::triggered, this, &MainWindow::startScan);
+    toolsMenu->addSeparator();
+    auto* aQuit = toolsMenu->addAction("Quit");
+    connect(aQuit, &QAction::triggered, this, &QMainWindow::close);
+
+    auto* helpMenu = menuBar()->addMenu("Help");
+    auto* aAbout = helpMenu->addAction("About Argus");
+    connect(aAbout, &QAction::triggered, this, [this]{
+        QMessageBox::about(this, "About Argus",
+            "<h3>Argus — Instant NTFS File Search</h3>"
+            "<p>Version 0.6.0. MIT-licensed C++20 + Qt6.</p>"
+            "<p><a href='https://github.com/0x4Devs/argus'>github.com/0x4Devs/argus</a></p>");
+    });
+
     loadOrScan();
 }
 

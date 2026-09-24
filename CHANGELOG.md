@@ -3,6 +3,26 @@
 All notable changes to Argus are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.6.0] — 2026-09-25
+
+### Added
+- **Fuzzy search mode** — new "Fuzzy" entry in the mode dropdown. Matches
+  characters in order regardless of gaps, scores them fzf-style
+  (consecutive bonus, word-boundary bonus, gap penalty), returns the top
+  results sorted by score. Example: `argsrc` matches `Argus source`.
+- **Duplicate finder** — *Tools → Find duplicates…* runs a background pipeline:
+  1. Bucket every non-empty file by exact byte size
+  2. For groups with more than one file, hash the first 64 KB with FNV-1a
+  3. Report groups that agree on both size and partial hash
+  Results appear in a tree grouped by size (largest wasted space on top).
+  Progress bar, cancel button, live "N duplicate groups — X GB recoverable".
+- **Menu bar** — Tools (Find duplicates, Re-scan, Quit) and Help (About).
+- **Extended keyboard shortcuts**:
+  - `Ctrl+Enter` — open the containing folder of the selected result
+  - `Alt+Enter`  — open the Windows shell Properties dialog
+  - `Delete`     — move selected items to the Recycle Bin (with prompt,
+    goes through `SHFileOperation` with `FOF_ALLOWUNDO`)
+
 ## [v0.5.0] — 2026-09-25
 
 ### Added

@@ -14,9 +14,10 @@
 namespace argus {
 
 enum class SearchMode {
-    Substring = 0,   // "foo"      matches any name containing "foo"
-    Wildcard  = 1,   // "*.mp4"    * = any, ? = one char
-    Regex     = 2,   // ".*\\.mp4$" full ECMAScript regex
+    Substring = 0,   // "foo"        matches any name containing "foo"
+    Wildcard  = 1,   // "*.mp4"      * = any, ? = one char
+    Regex     = 2,   // ".*\\.mp4$"  full ECMAScript regex
+    Fuzzy     = 3,   // "argsrc"     matches "argus source" out of order
 };
 
 struct SearchOptions {
