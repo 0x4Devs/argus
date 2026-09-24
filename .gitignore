@@ -1,0 +1,41 @@
+# Build output
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeUserPresets.json
+
+# Compiled artifacts
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.dll
+*.res
+
+# Editor / IDE
+.vscode/
+.vs/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Release staging + zips
+dist/
+
+# Interne / lokale Doku — NIE auf GitHub
+STATUS.md
+NOTES.md
+NOTES_*.md
+TODO.md
+TODO_*.md
+INTERNAL.md
+INTERNAL_*.md
+_local/
+_internal/
+.local/
+.internal/
