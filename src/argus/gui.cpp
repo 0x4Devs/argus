@@ -1177,6 +1177,7 @@ int main(int argc, char** argv) {
     QApplication app(argc, argv);
     QApplication::setApplicationName("Argus");
     QApplication::setOrganizationName("0x4Devs");
+    QApplication::setWindowIcon(QIcon(":/argus.png"));   // Fenster + Taskbar
     MainWindow w;
     w.show();
     return app.exec();

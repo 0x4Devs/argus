@@ -3,6 +3,18 @@
 All notable changes to Argus are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.7.0] — 2026-09-25
+
+### Added
+- **App icon** — a shield-and-eye motif embedded in `argus.exe`,
+  `argus-cli.exe` and `mftdump.exe`. Multi-resolution `.ico` (16 → 256 px)
+  used by Windows Explorer, and the same graphic loaded as a Qt resource
+  (`:/argus.png`) so it also appears in the window title bar and taskbar.
+- **README hero screenshot** — the running app with 1.5 M entries across
+  two NTFS volumes visible at the top of the README.
+- CMake option `ARGUS_ABI_FIX_LIBSTDCXX` (default ON) gates the vendor
+  DLL overlay so downstream builds against a matching Qt6 can turn it off.
+
 ## [v0.6.0] — 2026-09-25
 
 ### Added

@@ -24,10 +24,22 @@ if(WIN32)
         UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 endif()
 
+# ---------- Icon resource shared by all binaries ----------
+set(_icon_path "${CMAKE_SOURCE_DIR}/res/argus.ico")
+
+# ---------- Options ----------
+# Set OFF when Qt6 was rebuilt against the same GCC that produced libstdc++
+# in %MINGW_PREFIX%/bin. Currently ON locally because MSYS2 Qt6 6.11.2 was
+# built against GCC 16.1 while the toolchain has moved to 16.2 which no longer
+# exports _ZSt15__get_once_callv etc. CI turns this OFF.
+option(ARGUS_ABI_FIX_LIBSTDCXX
+       "Overlay the vendor/runtime_libs GCC 16.1 libstdc++/libgcc DLLs" ON)
+
 # ---------- CLI: mftdump.exe ----------
 if(WIN32 AND MINGW)
     set(_mft_rc "${CMAKE_BINARY_DIR}/mftdump.rc")
     file(WRITE "${_mft_rc}"
+        "1 ICON \"${_icon_path}\"\n"
         "1 24 \"${CMAKE_SOURCE_DIR}/res/mftdump.exe.manifest\"\n")
 endif()
 
@@ -41,7 +53,12 @@ if(WIN32 AND MINGW)
 endif()
 
 # ---------- Console CLI: argus-cli.exe ----------
-add_executable(argus-cli src/argus_cli/main.cpp)
+if(WIN32 AND MINGW)
+    set(_cli_rc "${CMAKE_BINARY_DIR}/argus_cli.rc")
+    file(WRITE "${_cli_rc}"
+        "1 ICON \"${_icon_path}\"\n")
+endif()
+add_executable(argus-cli src/argus_cli/main.cpp ${_cli_rc})
 target_link_libraries(argus-cli PRIVATE argus_core)
 if(WIN32 AND MINGW)
     target_link_options(argus-cli PRIVATE
@@ -58,10 +75,11 @@ find_package(Qt6 REQUIRED COMPONENTS Widgets)
 if(WIN32 AND MINGW)
     set(_argus_rc "${CMAKE_BINARY_DIR}/argus.rc")
     file(WRITE "${_argus_rc}"
+        "1 ICON \"${_icon_path}\"\n"
         "1 24 \"${CMAKE_SOURCE_DIR}/res/argus.exe.manifest\"\n")
 endif()
 
-add_executable(argus WIN32 src/argus/gui.cpp ${_argus_rc})
+add_executable(argus WIN32 src/argus/gui.cpp res/argus.qrc ${_argus_rc})
 target_link_libraries(argus PRIVATE
     argus_core
     Qt6::Widgets
@@ -105,14 +123,15 @@ if(MSYS_BASH)
     )
 endif()
 
-# 3) ABI-Fix: MSYS2 aktueller GCC 16.2 libstdc++ hat _ZSt15__get_once_callv
-#    nicht mehr; das vorgebaute Qt6 6.11.2 wurde gegen 16.1 gebaut und braucht es.
-add_custom_command(TARGET argus POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy
-            "${CMAKE_SOURCE_DIR}/vendor/runtime_libs/libstdc++-6.dll"
-            "$<TARGET_FILE_DIR:argus>/libstdc++-6.dll"
-    COMMAND ${CMAKE_COMMAND} -E copy
-            "${CMAKE_SOURCE_DIR}/vendor/runtime_libs/libgcc_s_seh-1.dll"
-            "$<TARGET_FILE_DIR:argus>/libgcc_s_seh-1.dll"
-    COMMENT "ABI-Fix: 16.1er libstdc++/libgcc einspielen"
-)
+# 3) Optional ABI-Fix: siehe Option-Definition oben.
+if(ARGUS_ABI_FIX_LIBSTDCXX)
+    add_custom_command(TARGET argus POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy
+                "${CMAKE_SOURCE_DIR}/vendor/runtime_libs/libstdc++-6.dll"
+                "$<TARGET_FILE_DIR:argus>/libstdc++-6.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy
+                "${CMAKE_SOURCE_DIR}/vendor/runtime_libs/libgcc_s_seh-1.dll"
+                "$<TARGET_FILE_DIR:argus>/libgcc_s_seh-1.dll"
+        COMMENT "ABI-Fix: 16.1er libstdc++/libgcc einspielen"
+    )
+endif()
