@@ -3,6 +3,25 @@
 All notable changes to Argus are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.5.0] — 2026-09-25
+
+### Added
+- **NTFS Details dialog** (right-click a result → *NTFS details…*):
+  - MFT record number, sequence, flags, hardlink count
+  - Table of every `$FILE_NAME` attribute on the record (POSIX / Win32 /
+    DOS / Win32+DOS namespaces, parent MFT ref, raw name)
+  - Table of every `$DATA` stream — the default stream and every
+    **Alternate Data Stream** (name, size, resident vs non-resident)
+- **`argus-cli.exe`** — console interface bundled next to the GUI:
+  - `argus-cli find "report ext:pdf size:>10MB"` — search from PowerShell
+  - `argus-cli list-drives` — list known NTFS volumes
+  - `--drive C`, `--limit N` flags
+  - Reads the same persistent cache as the GUI, never needs elevation
+- Persistent cache now stores the MFT runlist + volume geometry so
+  arbitrary MFT records can be read back on demand (bumped format version
+  to `ARGIDX02`)
+- Reverse-lookup `Index::mft_id_of(entry_idx)` for details lookups
+
 ## [v0.4.0] — 2026-09-25
 
 ### Added

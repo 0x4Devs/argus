@@ -11,6 +11,8 @@
 #include <string_view>
 #include <vector>
 
+#include "core/ntfs.h"
+
 namespace argus {
 
 // 32 Bytes pro Eintrag. Namen liegen im separaten Pool.
@@ -54,6 +56,9 @@ public:
     // Voller Pfad, absolut, mit Laufwerk (z.B. L"C:\\Users\\andre\\...").
     std::wstring        full_path(uint32_t i) const;
 
+    // Reverse lookup: entry_idx -> MFT record number (linear scan).
+    uint32_t            mft_id_of(uint32_t entry_idx) const;
+
     // Fuer die Search-Funktion: read-only Zugriff auf Rohdaten.
     const std::vector<Entry>&   entries() const { return entries_; }
     const std::vector<wchar_t>& name_pool() const { return name_pool_; }
@@ -79,6 +84,16 @@ public:
     uint64_t usn_journal_id() const  { return usn_journal_id_; }
     uint64_t next_usn() const        { return next_usn_; }
 
+    // Fuer On-demand-Lesen von MFT-Records: die Runlist des $MFT-$DATA und
+    // die Cluster-/Record-Geometrie.
+    struct Geometry {
+        uint32_t bytes_per_sector = 0;
+        uint32_t bytes_per_cluster = 0;
+        uint32_t bytes_per_mft_record = 0;
+    };
+    const Geometry& geometry() const { return geometry_; }
+    const std::vector<ntfs::DataRun>& mft_runs() const { return mft_runs_; }
+
 private:
     std::vector<Entry>    entries_;
     std::vector<wchar_t>  name_pool_;
@@ -88,9 +103,38 @@ private:
     uint64_t              volume_serial_   = 0;
     uint64_t              usn_journal_id_  = 0;
     uint64_t              next_usn_        = 0;
+
+    // Geometrie + Runlist des $MFT $DATA — nur nach ScanDrive() gueltig, wird
+    // aber auch aus dem Cache wiederhergestellt.
+    Geometry                    geometry_{};
+    std::vector<ntfs::DataRun>  mft_runs_;
 };
 
 // Wo Argus seinen Cache ablegt: %LOCALAPPDATA%\Argus\<drive>.aix
 std::wstring CacheFilePath(wchar_t drive_letter);
+
+// --------------- On-demand MFT record read ---------------
+
+struct MftDetails {
+    uint32_t mft_id       = 0;
+    uint16_t sequence     = 0;
+    uint16_t flags        = 0;
+    uint16_t hard_link_count = 0;
+    bool     ok           = false;
+    struct Name {
+        std::wstring name;
+        uint64_t     parent_mft;
+        uint8_t      ns;
+    };
+    std::vector<Name> names;
+    struct Stream {
+        std::wstring name;      // empty = default stream
+        uint64_t     size;
+        bool         resident;
+    };
+    std::vector<Stream> streams;
+};
+
+MftDetails ReadMftDetails(const Index& idx, uint32_t mft_id);
 
 } // namespace argus

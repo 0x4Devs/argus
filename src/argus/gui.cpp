@@ -37,6 +37,11 @@
 #include <QTableView>
 #include <QThread>
 #include <QTimer>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QFormLayout>
+#include <QPlainTextEdit>
+#include <QTableWidget>
 #include <QUrl>
 #include <QVBoxLayout>
 
@@ -51,6 +56,117 @@
 #include "core/ntfs.h"
 #include "core/query.h"
 #include "core/search.h"
+
+// ================== NtfsDetailsDialog ==================================
+// Right-click -> "NTFS details" reads the actual MFT record on demand and
+// shows hardlinks, alternate data streams and raw metadata.
+
+class NtfsDetailsDialog : public QDialog {
+    Q_OBJECT
+public:
+    NtfsDetailsDialog(const argus::MftDetails& d,
+                      const QString& primary_path,
+                      wchar_t drive_letter,
+                      QWidget* parent = nullptr)
+        : QDialog(parent) {
+        setWindowTitle("NTFS details");
+        resize(720, 520);
+
+        auto* root = new QVBoxLayout(this);
+        root->setContentsMargins(16, 14, 16, 12);
+        root->setSpacing(10);
+
+        // -------- Header form --------
+        auto* form = new QFormLayout();
+        form->setHorizontalSpacing(14);
+        form->setVerticalSpacing(4);
+
+        auto* pathLabel = new QLabel(primary_path);
+        pathLabel->setStyleSheet("font-weight: 600;");
+        pathLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        pathLabel->setWordWrap(true);
+        form->addRow("Path:", pathLabel);
+
+        form->addRow("Volume:", new QLabel(QString(QChar(drive_letter)) + ":"));
+        form->addRow("MFT record:", new QLabel(QString::number(d.mft_id)));
+        form->addRow("Sequence:",   new QLabel(QString::number(d.sequence)));
+
+        QStringList flag_names;
+        if (d.flags & 0x0001) flag_names << "IN_USE";
+        if (d.flags & 0x0002) flag_names << "DIRECTORY";
+        if (d.flags & 0x0004) flag_names << "EXTENSION";
+        form->addRow("Flags:", new QLabel(flag_names.isEmpty()
+                                          ? "—" : flag_names.join(" | ")));
+        form->addRow("Hard link count:", new QLabel(QString::number(d.hard_link_count)));
+
+        root->addLayout(form);
+
+        // -------- Names / Hardlinks --------
+        auto* namesLabel = new QLabel(QString("Names / hardlinks (%1)").arg(d.names.size()));
+        namesLabel->setStyleSheet("font-weight: 600; margin-top: 6px;");
+        root->addWidget(namesLabel);
+
+        auto* namesTable = new QTableWidget(int(d.names.size()), 3);
+        namesTable->setHorizontalHeaderLabels({"Namespace", "Parent MFT", "Name"});
+        namesTable->verticalHeader()->setVisible(false);
+        namesTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        namesTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+        namesTable->setAlternatingRowColors(true);
+        namesTable->horizontalHeader()->setStretchLastSection(true);
+        namesTable->setColumnWidth(0, 100);
+        namesTable->setColumnWidth(1, 100);
+        for (int i = 0; i < int(d.names.size()); ++i) {
+            const char* ns = "?";
+            switch (d.names[i].ns) {
+                case 0: ns = "POSIX";      break;
+                case 1: ns = "Win32";      break;
+                case 2: ns = "DOS";        break;
+                case 3: ns = "Win32+DOS";  break;
+            }
+            namesTable->setItem(i, 0, new QTableWidgetItem(ns));
+            namesTable->setItem(i, 1, new QTableWidgetItem(QString::number(d.names[i].parent_mft)));
+            namesTable->setItem(i, 2, new QTableWidgetItem(
+                QString::fromWCharArray(d.names[i].name.data(), int(d.names[i].name.size()))));
+        }
+        namesTable->setMinimumHeight(120);
+        root->addWidget(namesTable);
+
+        // -------- Data streams + ADS --------
+        int ads_count = 0;
+        for (const auto& s : d.streams) if (!s.name.empty()) ++ads_count;
+        auto* streamsLabel = new QLabel(QString("Data streams (%1, including %2 alternate)")
+                                       .arg(d.streams.size()).arg(ads_count));
+        streamsLabel->setStyleSheet("font-weight: 600; margin-top: 6px;");
+        root->addWidget(streamsLabel);
+
+        auto* streamsTable = new QTableWidget(int(d.streams.size()), 3);
+        streamsTable->setHorizontalHeaderLabels({"Stream name", "Size", "Storage"});
+        streamsTable->verticalHeader()->setVisible(false);
+        streamsTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        streamsTable->setAlternatingRowColors(true);
+        streamsTable->horizontalHeader()->setStretchLastSection(true);
+        streamsTable->setColumnWidth(0, 220);
+        streamsTable->setColumnWidth(1, 120);
+        for (int i = 0; i < int(d.streams.size()); ++i) {
+            const auto& s = d.streams[i];
+            QString name = s.name.empty()
+                          ? "<default>"
+                          : QString::fromWCharArray(s.name.data(), int(s.name.size()));
+            streamsTable->setItem(i, 0, new QTableWidgetItem(name));
+            streamsTable->setItem(i, 1, new QTableWidgetItem(
+                QLocale::system().formattedDataSize(qint64(s.size))));
+            streamsTable->setItem(i, 2, new QTableWidgetItem(s.resident ? "resident (in MFT)"
+                                                                        : "non-resident"));
+        }
+        streamsTable->setMinimumHeight(120);
+        root->addWidget(streamsTable);
+
+        // -------- Close button --------
+        auto* bb = new QDialogButtonBox(QDialogButtonBox::Close);
+        connect(bb, &QDialogButtonBox::rejected, this, &QDialog::reject);
+        root->addWidget(bb);
+    }
+};
 
 // ================== IconCache ==========================================
 
@@ -667,6 +783,8 @@ void MainWindow::onContextMenu(const QPoint& pos) {
     auto* aReveal = menu.addAction("Reveal in Explorer");
     menu.addSeparator();
     auto* aCopyPath = menu.addAction("Copy path");
+    menu.addSeparator();
+    auto* aDetails = menu.addAction("NTFS details…");
     QAction* chosen = menu.exec(table_->viewport()->mapToGlobal(pos));
 
     if (chosen == aOpen) {
@@ -680,6 +798,40 @@ void MainWindow::onContextMenu(const QPoint& pos) {
                       nullptr, SW_SHOWNORMAL);
     } else if (chosen == aCopyPath) {
         copySelectedPaths();
+    } else if (chosen == aDetails) {
+        // mft_id ist bei uns = Index in mft_to_idx, hier braucht ReadMftDetails
+        // aber die tatsaechliche MFT-Nummer. Wir suchen aus mft_to_idx zurueck.
+        const argus::Index& idx = multi_.index(h.drive_slot);
+        uint32_t mft_id = 0;
+        // Reverse-Lookup: waere idealer wenn Entry das MFT-ID speichern wuerde,
+        // aber fuer die Details reicht der Umweg.
+        for (uint32_t i = 0; i < idx.entry_count(); ++i) {}
+        // Direkter Weg: Entry hat kein mft_id, aber wir wissen dass entries_[k]
+        // an Position mft_to_idx_[mft_id]=k liegt. Wir suchen linear.
+        {
+            const auto& e_target = idx.entry(h.entry_idx);
+            (void)e_target;
+            // Linearer Scan der mft_to_idx-Umkehrung waere langsam. Statt dessen
+            // adden wir demnaechst mft_id direkt in Entry. Fuer MVP: linear scan.
+            // Alternativ: die Runlist ist da, wir koennten die MFT durchgehen
+            // und den Datensatz finden — aber die Reverse-Map ist auch okay.
+        }
+        // Reverse-Lookup mft_to_idx (public accessor fehlt — wir liefern hier
+        // Best-Effort: iterieren durch mft_to_idx im core und suchen h.entry_idx).
+        // Wir exponieren dafuer eine neue Methode idx.mft_id_for(entry_idx).
+        mft_id = h.entry_idx; // Platzhalter, wird durch Getter ueberschrieben:
+        // Wir nutzen die vorhandene entries()-API + externe Reverse-Suche:
+        // (Als korrektes Redesign kaeme mft_id ins Entry. Fuer jetzt reicht
+        // die Info aus dem Parent-Feld nicht — wir loesen ueber einen Getter.)
+
+        // Robustere Loesung: neue Methode Index::mft_id_of(entry_idx)
+        mft_id = idx.mft_id_of(h.entry_idx);
+
+        auto d = argus::ReadMftDetails(idx, mft_id);
+        auto path = idx.full_path(h.entry_idx);
+        QString qpath = QString::fromWCharArray(path.data(), int(path.size()));
+        NtfsDetailsDialog dlg(d, qpath, idx.drive_letter(), this);
+        dlg.exec();
     }
 }
 

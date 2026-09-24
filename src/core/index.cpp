@@ -93,6 +93,12 @@ std::wstring_view Index::name(uint32_t i) const {
     return std::wstring_view(name_pool_.data() + e.name_offset, e.name_length);
 }
 
+uint32_t Index::mft_id_of(uint32_t entry_idx) const {
+    for (size_t i = 0; i < mft_to_idx_.size(); ++i)
+        if (mft_to_idx_[i] == entry_idx) return uint32_t(i);
+    return UINT32_MAX;
+}
+
 std::wstring Index::full_path(uint32_t i) const {
     // Parent-Kette bis Root laufen, dann umkehren.
     const uint32_t kMaxDepth = 64;
@@ -229,8 +235,12 @@ bool Index::ScanDrive(wchar_t drive, ScanStats* stats) {
         }
     }
 
-    // Volume Serial merken (aus Boot-Sektor).
+    // Volume Serial + Geometrie + Runlist fuer On-demand-Reads merken.
     volume_serial_ = bs.volume_serial;
+    geometry_.bytes_per_sector     = g.bytes_per_sector;
+    geometry_.bytes_per_cluster    = g.bytes_per_cluster;
+    geometry_.bytes_per_mft_record = g.bytes_per_mft_record;
+    mft_runs_ = runs;
 
     // USN Journal Zustand abfragen — falls das Journal noch nicht existiert,
     // versuchen es zu erzeugen. Fehlschlag ist nicht fatal (Live-Updates dann
@@ -366,8 +376,8 @@ Index::UsnStats Index::ApplyUsnChanges() {
 
 namespace {
 
-constexpr char     kMagic[8] = {'A','R','G','I','D','X','0','1'};
-constexpr uint32_t kVersion  = 1;
+constexpr char     kMagic[8] = {'A','R','G','I','D','X','0','2'};
+constexpr uint32_t kVersion  = 2;
 
 bool WriteAll(FILE* f, const void* data, size_t n) {
     return std::fwrite(data, 1, n, f) == n;
@@ -415,6 +425,13 @@ bool Index::SaveTo(const std::wstring& path) const {
     if (ec > 0 && !WriteAll(f, entries_.data(), ec * sizeof(Entry))) return false;
     if (nc > 0 && !WriteAll(f, name_pool_.data(), nc * sizeof(wchar_t))) return false;
     if (mc > 0 && !WriteAll(f, mft_to_idx_.data(), mc * sizeof(uint32_t))) return false;
+
+    // v2: Geometrie + MFT-Runlist.
+    if (!WriteAll(f, &geometry_, sizeof(geometry_))) return false;
+    uint64_t run_count = mft_runs_.size();
+    if (!WriteAll(f, &run_count, 8)) return false;
+    if (run_count > 0 && !WriteAll(f, mft_runs_.data(), run_count * sizeof(ntfs::DataRun)))
+        return false;
     return true;
 }
 
@@ -449,11 +466,87 @@ bool Index::LoadFrom(const std::wstring& path) {
     if (nc > 0 && !ReadAll(f, name_pool_.data(), nc * sizeof(wchar_t))) return false;
     if (mc > 0 && !ReadAll(f, mft_to_idx_.data(), mc * sizeof(uint32_t))) return false;
 
+    if (!ReadAll(f, &geometry_, sizeof(geometry_))) return false;
+    uint64_t run_count = 0;
+    if (!ReadAll(f, &run_count, 8)) return false;
+    if (run_count > 1000000) return false;   // Plausibilitaet
+    mft_runs_.assign(run_count, {});
+    if (run_count > 0 && !ReadAll(f, mft_runs_.data(), run_count * sizeof(ntfs::DataRun)))
+        return false;
+
     drive_letter_   = wchar_t(dl);
     volume_serial_  = vs;
     usn_journal_id_ = jid;
     next_usn_       = nusn;
     return true;
+}
+
+// ================== On-demand MFT record read ==========================
+
+MftDetails ReadMftDetails(const Index& idx, uint32_t mft_id) {
+    MftDetails d;
+    d.mft_id = mft_id;
+    const auto& g = idx.geometry();
+    if (g.bytes_per_mft_record == 0 || idx.mft_runs().empty()) return d;
+
+    wchar_t path[16];
+    swprintf(path, 16, L"\\\\.\\%c:", idx.drive_letter());
+    HANDLE h = CreateFileW(path, GENERIC_READ,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE,
+                          nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return d;
+    struct Closer { HANDLE h; ~Closer(){ CloseHandle(h); } } closer{h};
+
+    // VCN + Offset innerhalb des Clusters ausrechnen.
+    const uint64_t record_offset = uint64_t(mft_id) * g.bytes_per_mft_record;
+    const uint64_t vcn           = record_offset / g.bytes_per_cluster;
+    const uint32_t off_in_cl     = uint32_t(record_offset % g.bytes_per_cluster);
+    const uint64_t byte_off      = ntfs::VcnToByteOffset(idx.mft_runs(), vcn, g.bytes_per_cluster);
+    if (byte_off == UINT64_MAX) return d;
+
+    std::vector<uint8_t> rec(g.bytes_per_mft_record);
+    LARGE_INTEGER li; li.QuadPart = LONGLONG(byte_off + off_in_cl);
+    if (!SetFilePointerEx(h, li, nullptr, FILE_BEGIN)) return d;
+    DWORD got = 0;
+    if (!ReadFile(h, rec.data(), (DWORD)rec.size(), &got, nullptr) || got != rec.size()) return d;
+    if (!ntfs::ApplyFixup(rec.data(), rec.size(), g.bytes_per_sector)) return d;
+
+    const auto* hdr = reinterpret_cast<const ntfs::MftRecordHeader*>(rec.data());
+    d.sequence         = hdr->sequence_number;
+    d.flags            = hdr->flags;
+    d.hard_link_count  = hdr->hard_link_count;
+
+    ntfs::WalkAttributes(rec.data(), rec.size(), [&](const ntfs::AttributeHeader* a) {
+        if (a->type == ntfs::kAttrFileName && !a->non_resident) {
+            if (auto fn = ntfs::ReadFileName(a)) {
+                MftDetails::Name n;
+                n.name       = std::move(fn->name);
+                n.parent_mft = fn->parent_record;
+                n.ns         = fn->ns;
+                d.names.push_back(std::move(n));
+            }
+        } else if (a->type == ntfs::kAttrData) {
+            MftDetails::Stream s;
+            if (a->name_length > 0) {
+                const wchar_t* nptr = reinterpret_cast<const wchar_t*>(
+                    reinterpret_cast<const uint8_t*>(a) + a->name_offset);
+                s.name.assign(nptr, a->name_length);
+            }
+            s.resident = !a->non_resident;
+            if (a->non_resident) {
+                const auto* nr = reinterpret_cast<const ntfs::NonResidentAttribute*>(a);
+                s.size = nr->data_size;
+            } else {
+                const auto* r = reinterpret_cast<const ntfs::ResidentAttribute*>(a);
+                s.size = r->value_length;
+            }
+            d.streams.push_back(std::move(s));
+        }
+        return true;
+    });
+
+    d.ok = true;
+    return d;
 }
 
 } // namespace argus

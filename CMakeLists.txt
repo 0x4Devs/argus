@@ -40,6 +40,15 @@ if(WIN32 AND MINGW)
     )
 endif()
 
+# ---------- Console CLI: argus-cli.exe ----------
+add_executable(argus-cli src/argus_cli/main.cpp)
+target_link_libraries(argus-cli PRIVATE argus_core)
+if(WIN32 AND MINGW)
+    target_link_options(argus-cli PRIVATE
+        -static -static-libgcc -static-libstdc++ -municode
+    )
+endif()
+
 # ---------- GUI: argus.exe (Qt6 Widgets) ----------
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
