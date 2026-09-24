@@ -8,7 +8,7 @@ Qt6 GUI.
 
 ![Argus indexing 1.5M files across two NTFS volumes](docs/screenshot.png)
 
-**Status:** v0.6.0 released — indexes millions of files across every NTFS
+**Status:** v0.7.0 released — indexes millions of files across every NTFS
 volume in seconds, then gives you live substring / wildcard / regex / fuzzy
 search, an advanced query syntax (`ext:pdf size:>10MB modified:<7d`), an
 NTFS details panel that surfaces hardlinks and Alternate Data Streams, a
@@ -78,7 +78,7 @@ requires elevated privileges).
 | v0.4 Advanced query syntax + multi-drive | ✅ released |
 | v0.5 NTFS details (hardlinks + ADS), console CLI | ✅ released |
 | v0.6 Fuzzy search, duplicate finder, power shortcuts | ✅ released |
-| v0.7 GitHub Actions CI, screenshots, polishing | 🔨 next |
+| v0.7 App icon, hero screenshot, README polish | ✅ released |
 | v0.8 Content search inside text files | planned |
 
 ## Build from source (Windows, MSYS2 + MinGW-w64)
