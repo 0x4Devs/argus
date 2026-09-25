@@ -37,8 +37,10 @@
 #include <QTableView>
 #include <QThread>
 #include <QTimer>
+#include <QAbstractNativeEventFilter>
 #include <QCloseEvent>
 #include <QCompleter>
+#include <QSystemTrayIcon>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFormLayout>
@@ -628,12 +630,20 @@ private:
 
     QStringListModel* history_model_ = nullptr;
 
+    // Tray + global hotkey
+    QSystemTrayIcon* tray_ = nullptr;
+    int hotkey_id_ = 1;
+    bool really_quit_ = false;
+
     void saveSettings();
     void restoreSettings();
     void rememberQuery(const QString&);
+    void setupTrayAndHotkey();
+    void showAndFocus();
 
 protected:
     void closeEvent(QCloseEvent*) override;
+    bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override;
 };
 
 MainWindow::MainWindow() {
@@ -860,7 +870,7 @@ MainWindow::MainWindow() {
     connect(aRescan, &QAction::triggered, this, &MainWindow::startScan);
     toolsMenu->addSeparator();
     auto* aQuit = toolsMenu->addAction("Quit");
-    connect(aQuit, &QAction::triggered, this, &QMainWindow::close);
+    connect(aQuit, &QAction::triggered, this, [this]{ really_quit_ = true; close(); });
 
     auto* helpMenu = menuBar()->addMenu("Help");
     auto* aHelp = helpMenu->addAction("Query syntax…\tF1");
@@ -876,6 +886,9 @@ MainWindow::MainWindow() {
             "<p><a href='https://github.com/0x4Devs/argus'>github.com/0x4Devs/argus</a></p>");
     });
 
+    // Tray icon + global hotkey (Ctrl+Alt+Space).
+    setupTrayAndHotkey();
+
     // Restore window state, last drive, sort, filter, history from QSettings.
     restoreSettings();
 
@@ -889,9 +902,68 @@ MainWindow::MainWindow() {
 
 void MainWindow::closeEvent(QCloseEvent* e) {
     saveSettings();
+    // Wenn Tray verfuegbar und der User nicht explizit "Quit" gedrueckt hat:
+    // minimieren statt beenden. So bleibt Argus per Global-Hotkey erreichbar.
+    if (!really_quit_ && tray_ && tray_->isVisible()) {
+        hide();
+        e->ignore();
+        return;
+    }
     scan_cancelled_.store(true);
     if (scan_thread_.joinable()) scan_thread_.join();
+    if (hotkey_id_) UnregisterHotKey(HWND(winId()), hotkey_id_);
     QMainWindow::closeEvent(e);
+}
+
+bool MainWindow::nativeEvent(const QByteArray& eventType, void* message, qintptr* result) {
+    (void)eventType; (void)result;
+    MSG* msg = static_cast<MSG*>(message);
+    if (msg && msg->message == WM_HOTKEY && int(msg->wParam) == hotkey_id_) {
+        showAndFocus();
+        return true;
+    }
+    return false;
+}
+
+void MainWindow::showAndFocus() {
+    if (isMinimized() || isHidden()) {
+        showNormal();
+    }
+    raise();
+    activateWindow();
+    search_->setFocus();
+    search_->selectAll();
+}
+
+void MainWindow::setupTrayAndHotkey() {
+    // Tray-Icon.
+    if (QSystemTrayIcon::isSystemTrayAvailable()) {
+        tray_ = new QSystemTrayIcon(QIcon(":/argus.png"), this);
+        tray_->setToolTip("Argus — Ctrl+Alt+Space to search");
+        auto* m = new QMenu(this);
+        auto* aShow = m->addAction("Show Argus");
+        auto* aQuit = m->addAction("Quit");
+        connect(aShow, &QAction::triggered, this, &MainWindow::showAndFocus);
+        connect(aQuit, &QAction::triggered, this, [this]{
+            really_quit_ = true;
+            close();
+        });
+        tray_->setContextMenu(m);
+        connect(tray_, &QSystemTrayIcon::activated, this,
+            [this](QSystemTrayIcon::ActivationReason r){
+                if (r == QSystemTrayIcon::Trigger || r == QSystemTrayIcon::DoubleClick)
+                    showAndFocus();
+            });
+        tray_->show();
+    }
+
+    // Global-Hotkey: Ctrl+Alt+Space
+    HWND hwnd = HWND(winId());
+    if (!RegisterHotKey(hwnd, hotkey_id_,
+                        MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_SPACE)) {
+        // Konflikt mit anderem Programm? Nicht kritisch — Tray funktioniert weiter.
+        hotkey_id_ = 0;
+    }
 }
 
 void MainWindow::saveSettings() {

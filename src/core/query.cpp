@@ -14,7 +14,15 @@ namespace {
 
 inline wchar_t to_lower(wchar_t c) {
     if (c >= L'A' && c <= L'Z') return c + 32;
-    switch (c) { case L'Ä': return L'ä'; case L'Ö': return L'ö'; case L'Ü': return L'ü'; }
+    if (c >= 0x00C0 && c <= 0x00DE && c != 0x00D7) return c + 32;
+    if (c >= 0x0100 && c <= 0x0137 && (c & 1) == 0) return c + 1;
+    if (c >= 0x0139 && c <= 0x0148 && (c & 1) == 1) return c + 1;
+    if (c >= 0x014A && c <= 0x0177 && (c & 1) == 0) return c + 1;
+    if (c >= 0x0179 && c <= 0x017E && (c & 1) == 1) return c + 1;
+    if (c >= 0x0410 && c <= 0x042F) return c + 32;
+    if (c >= 0x0400 && c <= 0x040F) return c + 80;
+    if (c >= 0x0391 && c <= 0x03A1) return c + 32;
+    if (c >= 0x03A3 && c <= 0x03A9) return c + 32;
     return c;
 }
 

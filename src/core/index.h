@@ -67,8 +67,10 @@ public:
     // Voller Pfad, absolut, mit Laufwerk (z.B. L"C:\\Users\\andre\\...").
     std::wstring        full_path(uint32_t i) const;
 
-    // Reverse lookup: entry_idx -> MFT record number (linear scan).
-    uint32_t            mft_id_of(uint32_t entry_idx) const;
+    // Reverse lookup: entry_idx -> MFT record number, O(1) via parallel table.
+    uint32_t            mft_id_of(uint32_t entry_idx) const {
+        return (entry_idx < entry_mft_id_.size()) ? entry_mft_id_[entry_idx] : UINT32_MAX;
+    }
 
     // Fuer die Search-Funktion: read-only Zugriff auf Rohdaten.
     const std::vector<Entry>&   entries() const { return entries_; }
@@ -110,6 +112,8 @@ private:
     std::vector<wchar_t>  name_pool_;
     // MFT-Record-Nr. -> Index in entries_. UINT32_MAX = kein Eintrag.
     std::vector<uint32_t> mft_to_idx_;
+    // Entry-Idx -> MFT-Record-Nr. (parallel zu entries_).
+    std::vector<uint32_t> entry_mft_id_;
     wchar_t               drive_letter_    = 0;
     uint64_t              volume_serial_   = 0;
     uint64_t              usn_journal_id_  = 0;

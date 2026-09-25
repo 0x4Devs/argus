@@ -3,6 +3,28 @@
 All notable changes to Argus are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.9.0] — 2026-09-25
+
+### Added
+- **Global hotkey `Ctrl+Alt+Space`** — pops Argus to the front from any
+  application, focuses the search box and pre-selects any existing text.
+  Registered via `RegisterHotKey`; handled in `nativeEvent()`.
+- **System tray icon** with a right-click menu (Show / Quit) and
+  left-click to toggle the window. The **X button now minimises to
+  tray** instead of quitting, so the global hotkey stays live in the
+  background. *Tools → Quit* or *tray → Quit* actually quits.
+- Extended **Unicode case-folding** — the fast search path now handles
+  Latin-1 Supplement, Latin Extended-A, Cyrillic (basic + supplement)
+  and Greek uppercase pairs, not just ASCII + three German umlauts.
+
+### Changed
+- `Index::mft_id_of()` is now **O(1)** — a parallel `entry_mft_id_`
+  vector is populated during scan (and updated when USN adds entries).
+  Was O(N) linear scan of `mft_to_idx_`. Opening the NTFS details
+  dialog on drives with millions of entries is now instant.
+- Cache format bumped to `ARGIDX03` to store the reverse table. Older
+  v0.7/v0.8 caches are ignored on load and a full scan runs once.
+
 ## [v0.8.0] — 2026-09-25
 
 ### Added

@@ -93,12 +93,6 @@ std::wstring_view Index::name(uint32_t i) const {
     return std::wstring_view(name_pool_.data() + e.name_offset, e.name_length);
 }
 
-uint32_t Index::mft_id_of(uint32_t entry_idx) const {
-    for (size_t i = 0; i < mft_to_idx_.size(); ++i)
-        if (mft_to_idx_[i] == entry_idx) return uint32_t(i);
-    return UINT32_MAX;
-}
-
 std::wstring Index::full_path(uint32_t i) const {
     // Parent-Kette bis Root laufen, dann umkehren.
     const uint32_t kMaxDepth = 64;
@@ -136,8 +130,10 @@ bool Index::ScanDrive(wchar_t drive, ScanStats* stats) {
     entries_.clear();
     name_pool_.clear();
     mft_to_idx_.clear();
+    entry_mft_id_.clear();
     entries_.reserve(kEntriesInitial);
     name_pool_.reserve(kNamePoolInitial);
+    entry_mft_id_.reserve(kEntriesInitial);
 
     wchar_t path[16];
     swprintf(path, 16, L"\\\\.\\%c:", drive);
@@ -254,6 +250,7 @@ bool Index::ScanDrive(wchar_t drive, ScanStats* stats) {
 
                     const uint32_t idx = uint32_t(entries_.size());
                     entries_.push_back(e);
+                    entry_mft_id_.push_back(uint32_t(records_seen));
                     if (records_seen < mft_to_idx_.size()) {
                         mft_to_idx_[records_seen] = idx;
                     }
@@ -379,6 +376,7 @@ Index::UsnStats Index::ApplyUsnChanges() {
                 e.modified_time = timestamp;
                 const uint32_t new_idx = uint32_t(entries_.size());
                 entries_.push_back(e);
+                entry_mft_id_.push_back(mft_id);
                 if (mft_id >= mft_to_idx_.size())
                     mft_to_idx_.resize(mft_id + 1, UINT32_MAX);
                 mft_to_idx_[mft_id] = new_idx;
@@ -407,8 +405,8 @@ Index::UsnStats Index::ApplyUsnChanges() {
 
 namespace {
 
-constexpr char     kMagic[8] = {'A','R','G','I','D','X','0','2'};
-constexpr uint32_t kVersion  = 2;
+constexpr char     kMagic[8] = {'A','R','G','I','D','X','0','3'};
+constexpr uint32_t kVersion  = 3;
 
 bool WriteAll(FILE* f, const void* data, size_t n) {
     return std::fwrite(data, 1, n, f) == n;
@@ -463,6 +461,11 @@ bool Index::SaveTo(const std::wstring& path) const {
     if (!WriteAll(f, &run_count, 8)) return false;
     if (run_count > 0 && !WriteAll(f, mft_runs_.data(), run_count * sizeof(ntfs::DataRun)))
         return false;
+    // v3: parallel table entry_idx -> mft_id (for O(1) reverse lookup)
+    uint64_t emi_count = entry_mft_id_.size();
+    if (!WriteAll(f, &emi_count, 8)) return false;
+    if (emi_count > 0 && !WriteAll(f, entry_mft_id_.data(), emi_count * sizeof(uint32_t)))
+        return false;
     return true;
 }
 
@@ -503,6 +506,13 @@ bool Index::LoadFrom(const std::wstring& path) {
     if (run_count > 1000000) return false;   // Plausibilitaet
     mft_runs_.assign(run_count, {});
     if (run_count > 0 && !ReadAll(f, mft_runs_.data(), run_count * sizeof(ntfs::DataRun)))
+        return false;
+    // v3: entry_mft_id_ parallel table
+    uint64_t emi_count = 0;
+    if (!ReadAll(f, &emi_count, 8)) return false;
+    if (emi_count > 100ULL * 1000 * 1000) return false;
+    entry_mft_id_.assign(emi_count, 0);
+    if (emi_count > 0 && !ReadAll(f, entry_mft_id_.data(), emi_count * sizeof(uint32_t)))
         return false;
 
     drive_letter_   = wchar_t(dl);
