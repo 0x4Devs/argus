@@ -8,12 +8,13 @@ Qt6 GUI.
 
 ![Argus indexing 1.5M files across two NTFS volumes](docs/screenshot.png)
 
-**Status:** v0.7.0 released — indexes millions of files across every NTFS
-volume in seconds, then gives you live substring / wildcard / regex / fuzzy
-search, an advanced query syntax (`ext:pdf size:>10MB modified:<7d`), an
-NTFS details panel that surfaces hardlinks and Alternate Data Streams, a
-duplicate finder, and a console CLI. See [Releases](../../releases) for the
-portable Windows zip.
+**Status:** v0.10.0 released — indexes millions of files across every NTFS
+volume in seconds, live search with 4 modes, an advanced query syntax with
+**content search inside text files** (`ext:json content:api_key`), an NTFS
+details panel that surfaces hardlinks and Alternate Data Streams, a duplicate
+finder, a console CLI, a **system tray icon** and a **`Ctrl+Alt+Space`
+global hotkey** so it is always one keystroke away. See
+[Releases](../../releases) for the portable Windows zip.
 
 ## Why?
 
@@ -79,7 +80,10 @@ requires elevated privileges).
 | v0.5 NTFS details (hardlinks + ADS), console CLI | ✅ released |
 | v0.6 Fuzzy search, duplicate finder, power shortcuts | ✅ released |
 | v0.7 App icon, hero screenshot, README polish | ✅ released |
-| v0.8 Content search inside text files | planned |
+| v0.8 F1 help, QSettings persistence, search history, robustness | ✅ released |
+| v0.9 Global hotkey Ctrl+Alt+Space, tray icon, extended Unicode, O(1) reverse lookup | ✅ released |
+| v0.10 Content search inside text files (`content:api_key`) | ✅ released |
+| v0.11 Trigram index for sub-100 ms searches on 5M+ files | planned |
 
 ## Build from source (Windows, MSYS2 + MinGW-w64)
 
