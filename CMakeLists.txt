@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(argus VERSION 0.7.1 LANGUAGES CXX)
+project(argus VERSION 0.8.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -79,7 +79,7 @@ if(WIN32 AND MINGW)
         "1 24 \"${CMAKE_SOURCE_DIR}/res/argus.exe.manifest\"\n")
 endif()
 
-add_executable(argus WIN32 src/argus/gui.cpp res/argus.qrc ${_argus_rc})
+add_executable(argus WIN32 src/argus/gui.cpp src/argus/help_dialog.h res/argus.qrc ${_argus_rc})
 target_compile_definitions(argus PRIVATE ARGUS_VERSION="${PROJECT_VERSION}")
 target_link_libraries(argus PRIVATE
     argus_core

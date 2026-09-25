@@ -37,6 +37,8 @@
 #include <QTableView>
 #include <QThread>
 #include <QTimer>
+#include <QCloseEvent>
+#include <QCompleter>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFormLayout>
@@ -45,6 +47,8 @@
 #include <QMutex>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QSettings>
+#include <QStringListModel>
 #include <QTableWidget>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
@@ -53,6 +57,8 @@
 
 #include <mutex>
 #include <unordered_map>
+
+#include "help_dialog.h"
 
 #include <algorithm>
 #include <atomic>
@@ -618,7 +624,16 @@ private:
     argus::MultiIndex::AggregateStats stats_;
     std::thread scan_thread_;
     std::atomic<bool> scan_cancelled_{false};
-    std::vector<wchar_t> avail_;  // populated in ctor
+    std::vector<wchar_t> avail_;
+
+    QStringListModel* history_model_ = nullptr;
+
+    void saveSettings();
+    void restoreSettings();
+    void rememberQuery(const QString&);
+
+protected:
+    void closeEvent(QCloseEvent*) override;
 };
 
 MainWindow::MainWindow() {
@@ -671,10 +686,19 @@ MainWindow::MainWindow() {
     v->addLayout(head);
 
     // Query syntax hint (dim, single line).
-    hint_ = new QLabel("Hints:  ext:pdf   type:image|video|audio|document|archive|code   "
-                       "size:>100MB   modified:<7d   path:downloads   !exclude");
-    hint_->setStyleSheet("color: palette(mid); font-size: 11px;");
+    hint_ = new QLabel("Query hints — press F1 for full syntax:  "
+                       "<b>ext:pdf</b>  <b>type:image</b>  <b>size:&gt;100MB</b>  "
+                       "<b>modified:&lt;7d</b>  <b>path:downloads</b>  <b>!exclude</b>");
+    hint_->setTextFormat(Qt::RichText);
+    hint_->setStyleSheet("color: palette(mid); font-size: 12px;");
     v->addWidget(hint_);
+
+    // -------- Search history via completer --------
+    history_model_ = new QStringListModel(this);
+    auto* completer = new QCompleter(history_model_, this);
+    completer->setCaseSensitivity(Qt::CaseInsensitive);
+    completer->setCompletionMode(QCompleter::PopupCompletion);
+    search_->setCompleter(completer);
 
     // -------- Table --------
     table_ = new QTableView();
@@ -784,6 +808,13 @@ MainWindow::MainWindow() {
     });
 
     // Delete -> move to recycle bin (with confirmation).
+    // F1 -> Query syntax help.
+    auto* sc_help = new QShortcut(QKeySequence("F1"), this);
+    connect(sc_help, &QShortcut::activated, this, [this]{
+        HelpDialog dlg(this);
+        dlg.exec();
+    });
+
     auto* sc_del = new QShortcut(QKeySequence("Delete"), table_);
     sc_del->setContext(Qt::WidgetShortcut);
     connect(sc_del, &QShortcut::activated, this, [this]{
@@ -832,6 +863,8 @@ MainWindow::MainWindow() {
     connect(aQuit, &QAction::triggered, this, &QMainWindow::close);
 
     auto* helpMenu = menuBar()->addMenu("Help");
+    auto* aHelp = helpMenu->addAction("Query syntax…\tF1");
+    connect(aHelp, &QAction::triggered, this, [this]{ HelpDialog(this).exec(); });
     auto* aAbout = helpMenu->addAction("About Argus");
     connect(aAbout, &QAction::triggered, this, [this]{
 #ifndef ARGUS_VERSION
@@ -843,7 +876,59 @@ MainWindow::MainWindow() {
             "<p><a href='https://github.com/0x4Devs/argus'>github.com/0x4Devs/argus</a></p>");
     });
 
+    // Restore window state, last drive, sort, filter, history from QSettings.
+    restoreSettings();
+
+    // When user presses Enter in search box, remember the query.
+    connect(search_, &QLineEdit::returnPressed, this, [this]{
+        rememberQuery(search_->text());
+    });
+
     loadOrScan();
+}
+
+void MainWindow::closeEvent(QCloseEvent* e) {
+    saveSettings();
+    scan_cancelled_.store(true);
+    if (scan_thread_.joinable()) scan_thread_.join();
+    QMainWindow::closeEvent(e);
+}
+
+void MainWindow::saveSettings() {
+    QSettings s;
+    s.setValue("mainwindow/geometry",   saveGeometry());
+    s.setValue("mainwindow/state",      saveState());
+    s.setValue("table/header",          table_->horizontalHeader()->saveState());
+    s.setValue("ui/drive",              drive_combo_->currentText());
+    s.setValue("ui/mode",               mode_combo_->currentIndex());
+    s.setValue("ui/filter",             filter_combo_->currentIndex());
+    s.setValue("search/history",        history_model_->stringList());
+}
+
+void MainWindow::restoreSettings() {
+    QSettings s;
+    QByteArray geom = s.value("mainwindow/geometry").toByteArray();
+    if (!geom.isEmpty()) restoreGeometry(geom);
+    QByteArray st = s.value("mainwindow/state").toByteArray();
+    if (!st.isEmpty()) restoreState(st);
+    QByteArray hdr = s.value("table/header").toByteArray();
+    if (!hdr.isEmpty()) table_->horizontalHeader()->restoreState(hdr);
+
+    QString drive = s.value("ui/drive").toString();
+    int di = drive_combo_->findText(drive);
+    if (di >= 0) drive_combo_->setCurrentIndex(di);
+    mode_combo_->setCurrentIndex(s.value("ui/mode", 0).toInt());
+    filter_combo_->setCurrentIndex(s.value("ui/filter", 0).toInt());
+    history_model_->setStringList(s.value("search/history").toStringList());
+}
+
+void MainWindow::rememberQuery(const QString& q) {
+    if (q.trimmed().isEmpty()) return;
+    QStringList list = history_model_->stringList();
+    list.removeAll(q);
+    list.prepend(q);
+    while (list.size() > 20) list.removeLast();
+    history_model_->setStringList(list);
 }
 
 MainWindow::~MainWindow() {
@@ -1090,6 +1175,8 @@ void MainWindow::onContextMenu(const QPoint& pos) {
     QMenu menu(this);
     auto* aOpen = menu.addAction(is_dir ? "Open folder" : "Open file");
     auto* aReveal = menu.addAction("Reveal in Explorer");
+    QAction* aSearchInside = nullptr;
+    if (is_dir) aSearchInside = menu.addAction("Search only inside this folder");
     menu.addSeparator();
     auto* aCopyPath = menu.addAction("Copy path");
     menu.addSeparator();
@@ -1105,6 +1192,21 @@ void MainWindow::onContextMenu(const QPoint& pos) {
         ShellExecuteW(nullptr, L"open", L"explorer.exe",
                       reinterpret_cast<LPCWSTR>(param.utf16()),
                       nullptr, SW_SHOWNORMAL);
+    } else if (chosen == aSearchInside) {
+        auto path = multi_.index(h.drive_slot).full_path(h.entry_idx);
+        QString qpath = QString::fromWCharArray(path.data(), int(path.size()));
+        // Alle whitespace-Zeichen im Pfad werden fuer path: nicht unterstuetzt —
+        // wir tolerieren sie einfach als Teil des Substring.
+        QString existing = search_->text().trimmed();
+        // Vorherige path: aus dem Query entfernen falls vorhanden.
+        QStringList parts;
+        for (const auto& tok : existing.split(' ', Qt::SkipEmptyParts))
+            if (!tok.startsWith("path:") && !tok.startsWith("!path:"))
+                parts << tok;
+        parts << ("path:" + qpath);
+        search_->setText(parts.join(' '));
+        mode_combo_->setCurrentIndex(0);       // Text-Mode fuer path: Support
+        runSearch();
     } else if (chosen == aCopyPath) {
         copySelectedPaths();
     } else if (chosen == aDetails) {
@@ -1180,7 +1282,8 @@ int main(int argc, char** argv) {
     QApplication app(argc, argv);
     QApplication::setApplicationName("Argus");
     QApplication::setOrganizationName("0x4Devs");
-    QApplication::setWindowIcon(QIcon(":/argus.png"));   // Fenster + Taskbar
+    QApplication::setOrganizationDomain("argus.0x4devs.local");  // fuer QSettings
+    QApplication::setWindowIcon(QIcon(":/argus.png"));
     MainWindow w;
     w.show();
     return app.exec();

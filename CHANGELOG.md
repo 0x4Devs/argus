@@ -3,6 +3,31 @@
 All notable changes to Argus are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.0] — 2026-09-25
+
+### Added
+- **F1 query syntax help dialog** — full reference with examples for
+  every predicate, mode and shortcut. Also linked from Help menu.
+- **Persistent window state** — position, size, column widths,
+  last-selected drive, search mode, filter, sort column and order are
+  all restored on the next launch (via `QSettings` under
+  `HKCU\Software\0x4Devs\Argus`).
+- **Search history** — the last 20 queries appear as an autocomplete
+  dropdown as soon as you start typing (populated on Enter).
+- **Right-click a folder → "Search only inside this folder"** — inserts
+  a `path:<full folder path>` predicate into the current query without
+  losing what you already typed.
+- The query-hint line under the search field is now Rich-Text (bolded
+  keywords, slightly larger) and points to F1 for the full syntax.
+
+### Robustness
+- Try/catch guard around every MFT record processed during a scan.
+  Corrupt or truncated records are counted as *skipped* and no longer
+  bring down the whole indexing pass.
+- Concrete `ScanStats::Error` codes returned when a scan fails (access
+  denied, not NTFS, boot-sector read failed, MFT read failed, MFT
+  record 0 has no `$DATA`) — enables clearer error messages in the GUI.
+
 ## [v0.7.1] — 2026-09-25
 
 ### Fixed

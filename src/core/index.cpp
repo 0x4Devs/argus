@@ -144,20 +144,40 @@ bool Index::ScanDrive(wchar_t drive, ScanStats* stats) {
     HANDLE h = CreateFileW(path, GENERIC_READ,
                           FILE_SHARE_READ | FILE_SHARE_WRITE,
                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
+    if (h == INVALID_HANDLE_VALUE) {
+        if (stats) {
+            stats->error.store(int(GetLastError() == ERROR_ACCESS_DENIED
+                                  ? ScanStats::Error::AccessDenied
+                                  : ScanStats::Error::BootReadFailed));
+            stats->done.store(true);
+        }
+        return false;
+    }
 
     struct Closer { HANDLE h; ~Closer(){ CloseHandle(h); } } closer{h};
 
     // Boot-Sektor lesen.
     ntfs::BootSector bs{};
-    if (!ReadAt(h, 0, &bs, sizeof(bs))) return false;
-    if (std::memcmp(bs.oem_id, "NTFS    ", 8) != 0) return false;
+    if (!ReadAt(h, 0, &bs, sizeof(bs))) {
+        if (stats) { stats->error.store(int(ScanStats::Error::BootReadFailed)); stats->done.store(true); }
+        return false;
+    }
+    if (std::memcmp(bs.oem_id, "NTFS    ", 8) != 0) {
+        if (stats) { stats->error.store(int(ScanStats::Error::NotNtfs)); stats->done.store(true); }
+        return false;
+    }
     auto g = ntfs::ParseBootSector(bs);
 
     // MFT-Record 0 lesen.
     std::vector<uint8_t> rec0(g.bytes_per_mft_record);
-    if (!ReadAt(h, g.mft_byte_offset, rec0.data(), (DWORD)rec0.size())) return false;
-    if (!ntfs::ApplyFixup(rec0.data(), rec0.size(), g.bytes_per_sector)) return false;
+    if (!ReadAt(h, g.mft_byte_offset, rec0.data(), (DWORD)rec0.size())) {
+        if (stats) { stats->error.store(int(ScanStats::Error::MftReadFailed)); stats->done.store(true); }
+        return false;
+    }
+    if (!ntfs::ApplyFixup(rec0.data(), rec0.size(), g.bytes_per_sector)) {
+        if (stats) { stats->error.store(int(ScanStats::Error::MftReadFailed)); stats->done.store(true); }
+        return false;
+    }
 
     // Nicht-residentes $DATA in Record 0 finden.
     const ntfs::NonResidentAttribute* data_attr = nullptr;
@@ -169,7 +189,10 @@ bool Index::ScanDrive(wchar_t drive, ScanStats* stats) {
             }
             return true;
         });
-    if (!data_attr) return false;
+    if (!data_attr) {
+        if (stats) { stats->error.store(int(ScanStats::Error::NoDataAttr)); stats->done.store(true); }
+        return false;
+    }
 
     // Runlist decodieren.
     const uint8_t* rl_ptr = reinterpret_cast<const uint8_t*>(data_attr) + data_attr->runlist_offset;
@@ -203,33 +226,41 @@ bool Index::ScanDrive(wchar_t drive, ScanStats* stats) {
             for (uint32_t k = 0; k < recs_here && records_seen < total_records;
                  ++k, ++records_seen) {
                 uint8_t* rec = buf.data() + k * g.bytes_per_mft_record;
-                if (std::memcmp(rec, "FILE", 4) != 0) continue;
-                if (!ntfs::ApplyFixup(rec, g.bytes_per_mft_record, g.bytes_per_sector)) continue;
+                // Defensive: alles was hier schiefgeht wird geskippt statt zu craschen.
+                try {
+                    if (std::memcmp(rec, "FILE", 4) != 0) {
+                        if (stats) stats->skipped.fetch_add(1);
+                        continue;
+                    }
+                    if (!ntfs::ApplyFixup(rec, g.bytes_per_mft_record, g.bytes_per_sector)) {
+                        if (stats) stats->skipped.fetch_add(1);
+                        continue;
+                    }
+                    const auto* h_rec = reinterpret_cast<const ntfs::MftRecordHeader*>(rec);
+                    if (!(h_rec->flags & ntfs::kMftFlagInUse)) continue;
+                    if (h_rec->base_record != 0) continue;
 
-                const auto* h_rec = reinterpret_cast<const ntfs::MftRecordHeader*>(rec);
-                if (!(h_rec->flags & ntfs::kMftFlagInUse)) continue;
-                // Extension-Records ohne eigene FILE_NAME skippen (base_record != 0).
-                if (h_rec->base_record != 0) continue;
+                    BestName bn = ExtractBestName(rec, g.bytes_per_mft_record, name_pool_);
+                    if (!bn.found) continue;
+                    if (h_rec->flags & ntfs::kMftFlagDirectory) bn.flags |= kFlagDirectory;
 
-                BestName bn = ExtractBestName(rec, g.bytes_per_mft_record, name_pool_);
-                if (!bn.found) continue;
-                if (h_rec->flags & ntfs::kMftFlagDirectory) bn.flags |= kFlagDirectory;
+                    Entry e{};
+                    e.parent_mft    = bn.parent_mft;
+                    e.name_offset   = bn.name_offset;
+                    e.name_length   = bn.name_length;
+                    e.flags         = bn.flags;
+                    e.size          = bn.size;
+                    e.modified_time = bn.modified;
 
-                Entry e{};
-                e.parent_mft    = bn.parent_mft;
-                e.name_offset   = bn.name_offset;
-                e.name_length   = bn.name_length;
-                e.flags         = bn.flags;
-                e.size          = bn.size;
-                e.modified_time = bn.modified;
-
-                const uint32_t idx = uint32_t(entries_.size());
-                entries_.push_back(e);
-                if (records_seen < mft_to_idx_.size()) {
-                    mft_to_idx_[records_seen] = idx;
+                    const uint32_t idx = uint32_t(entries_.size());
+                    entries_.push_back(e);
+                    if (records_seen < mft_to_idx_.size()) {
+                        mft_to_idx_[records_seen] = idx;
+                    }
+                    if (stats) stats->entries.fetch_add(1);
+                } catch (...) {
+                    if (stats) stats->skipped.fetch_add(1);
                 }
-
-                if (stats) stats->entries.fetch_add(1);
             }
             if (stats) stats->records_seen.store(records_seen);
         }

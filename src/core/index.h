@@ -36,8 +36,19 @@ public:
         std::atomic<uint64_t> total_records{0};
         std::atomic<uint64_t> entries{0};
         std::atomic<uint64_t> bytes_read{0};
+        std::atomic<uint64_t> skipped{0};     // records with bad signature or fixup
         std::atomic<bool>     done{false};
         std::atomic<bool>     ok{false};
+        // Fehlerklasse damit die GUI eine konkrete Meldung zeigen kann.
+        enum class Error {
+            None = 0,
+            AccessDenied,       // requires admin
+            NotNtfs,            // volume is FAT32/exFAT/ReFS
+            BootReadFailed,     // could not read sector 0
+            MftReadFailed,
+            NoDataAttr,         // MFT record 0 missing $DATA
+        };
+        std::atomic<int> error{int(Error::None)};
     };
 
     // Fuellt das Index-Objekt durch rohes Lesen des NTFS-MFT.
