@@ -3,6 +3,29 @@
 All notable changes to Argus are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.10.0] — 2026-09-25
+
+### Added
+- **Content search inside text files** — new query predicate
+  `content:api_key` (also `contains:...`). Reads the first 10 MB of each
+  candidate file and does a case-insensitive substring search.
+- Extension whitelist covers common text formats: source code
+  (`cpp`, `h`, `py`, `js`, `ts`, `go`, `rs`, `java`, `cs`, `rb`, `php`,
+  `swift`, `kt`, `dart`, `vue`, `svelte`, ...), docs (`txt`, `md`, `rst`,
+  `log`), config (`ini`, `conf`, `cfg`, `yaml`, `toml`, `json`, `xml`,
+  `env`), web (`html`, `css`, `scss`), scripts (`sh`, `bat`, `ps1`,
+  `cmake`), data (`csv`, `tsv`, `sql`), and diffs (`diff`, `patch`).
+- Files larger than 100 MB are skipped entirely; only the first 10 MB
+  are read for smaller ones.
+- F1 help dialog documents the new predicate and warns to combine it
+  with a narrowing predicate (`ext:json content:api_key`) to avoid
+  scanning millions of files.
+
+### Query engine
+- Predicates evaluate in query order and short-circuit on first miss,
+  so users who put cheap filters (`ext:`, `size:`) before `content:`
+  keep interactive latency.
+
 ## [v0.9.0] — 2026-09-25
 
 ### Added

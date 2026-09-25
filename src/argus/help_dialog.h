@@ -85,6 +85,16 @@ private:
   <li>Units: s, m, h, d, w, y</li>
 </ul>
 
+<h3>Inside file content (text files only)</h3>
+<ul>
+  <li><code>content:api_key</code> — file content contains "api_key"</li>
+  <li><b>Combine with a narrowing predicate!</b>
+  <code>ext:json content:api_key</code> is fast (opens ~10 files),
+  <code>content:api_key</code> alone is slow (opens millions).</li>
+  <li>Only text formats are read (source code, docs, config, scripts).
+  Binaries and files &gt;100 MB are skipped. First 10 MB per file.</li>
+</ul>
+
 <h3>Negation</h3>
 <ul>
   <li><code>!temp</code> — name must NOT contain "temp"</li>

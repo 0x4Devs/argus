@@ -698,7 +698,8 @@ MainWindow::MainWindow() {
     // Query syntax hint (dim, single line).
     hint_ = new QLabel("Query hints — press F1 for full syntax:  "
                        "<b>ext:pdf</b>  <b>type:image</b>  <b>size:&gt;100MB</b>  "
-                       "<b>modified:&lt;7d</b>  <b>path:downloads</b>  <b>!exclude</b>");
+                       "<b>modified:&lt;7d</b>  <b>path:downloads</b>  "
+                       "<b>content:api_key</b>  <b>!exclude</b>");
     hint_->setTextFormat(Qt::RichText);
     hint_->setStyleSheet("color: palette(mid); font-size: 12px;");
     v->addWidget(hint_);

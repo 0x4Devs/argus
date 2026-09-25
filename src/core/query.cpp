@@ -1,8 +1,10 @@
 #include "core/query.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cwctype>
 #include <cstring>
+#include <vector>
 
 #include <windows.h>
 
@@ -122,6 +124,60 @@ std::wstring_view name_extension(std::wstring_view name) {
     return {};
 }
 
+// Extension-Whitelist fuer Content-Suche (Textformate).
+bool is_text_extension(std::wstring_view ext_lc) {
+    static const wchar_t* kExts[] = {
+        L"txt", L"md", L"rst", L"log", L"csv", L"tsv", L"ini", L"conf", L"cfg",
+        L"cpp", L"h", L"hpp", L"c", L"cc", L"cs", L"py", L"js", L"ts", L"jsx",
+        L"tsx", L"go", L"rs", L"java", L"rb", L"php", L"pl", L"lua", L"swift",
+        L"html", L"htm", L"xml", L"yaml", L"yml", L"toml", L"json", L"css",
+        L"scss", L"less", L"sh", L"bat", L"ps1", L"cmake", L"diff", L"patch",
+        L"sql", L"env", L"gitignore", L"m", L"mm", L"kt", L"dart", L"vue", L"svelte",
+    };
+    for (auto* e : kExts) if (ext_lc == e) return true;
+    return false;
+}
+
+// Case-insensitive Bytes-Substring (ASCII-Fold).
+bool bytes_contain_ci(const char* hay, size_t hay_len,
+                    const char* needle, size_t needle_len) {
+    if (needle_len == 0) return true;
+    if (hay_len < needle_len) return false;
+    auto tolow = [](char c) -> char {
+        return (c >= 'A' && c <= 'Z') ? (c + 32) : c;
+    };
+    const size_t last = hay_len - needle_len;
+    for (size_t i = 0; i <= last; ++i) {
+        size_t j = 0;
+        for (; j < needle_len; ++j) {
+            if (tolow(hay[i + j]) != needle[j]) break;
+        }
+        if (j == needle_len) return true;
+    }
+    return false;
+}
+
+// Datei lesen (bis 10 MB) und darin nach needle_lc suchen.
+bool file_contains(const std::wstring& path, const std::string& needle_lc) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                          nullptr, OPEN_EXISTING,
+                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                          nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    struct Closer { HANDLE h; ~Closer(){ CloseHandle(h); } } cl{h};
+
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart == 0) return false;
+    constexpr uint64_t kMaxRead = 10ULL * 1024 * 1024;   // 10 MB
+    const uint32_t to_read = uint32_t(std::min<uint64_t>(sz.QuadPart, kMaxRead));
+
+    std::vector<char> buf(to_read);
+    DWORD got = 0;
+    if (!ReadFile(h, buf.data(), to_read, &got, nullptr)) return false;
+    return bytes_contain_ci(buf.data(), got, needle_lc.data(), needle_lc.size());
+}
+
 // Type -> extension set (all lowercase).
 bool ext_in_type(std::wstring_view ext_lc, const std::string& type) {
     static const struct { const char* type; const wchar_t* exts; } kTable[] = {
@@ -200,6 +256,15 @@ Query ParseQuery(std::wstring_view input) {
         } else if (field_lc == "path") {
             p.kind = QueryPredicate::PathContains;
             p.text = to_lower_str(value);
+        } else if (field_lc == "content" || field_lc == "contains") {
+            p.kind = QueryPredicate::ContentContains;
+            std::wstring v = to_lower_str(value);
+            // In UTF-8 zum Byte-Vergleich runter.
+            int need = WideCharToMultiByte(CP_UTF8, 0, v.data(), (int)v.size(),
+                                          nullptr, 0, nullptr, nullptr);
+            p.content_lc.assign(need, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, v.data(), (int)v.size(),
+                                p.content_lc.data(), need, nullptr, nullptr);
         } else if (field_lc == "size") {
             p.kind = QueryPredicate::SizeCompare;
             size_t consumed = 0;
@@ -321,6 +386,17 @@ bool MatchQuery(const Query& q, const Index& idx, uint32_t entry_idx) {
             case QueryPredicate::CreatedCmp:
                 ok = true;  // v0.4 speichert creation_time nicht separat
                 break;
+            case QueryPredicate::ContentContains: {
+                if (e.flags & kFlagDirectory) { ok = false; break; }
+                // Nur bei Textformaten - alles andere wuerde stundenlang lesen.
+                if (!is_text_extension(ext_lc)) { ok = false; break; }
+                // Sinnvoller Groessen-Filter — wenn Datei > 10MB, nur die ersten
+                // 10MB werden gelesen, aber Datei-Objekte > 100MB skippen wir
+                // ganz um nicht auf Riesen-Logs zu warten.
+                if (e.size > 100ULL * 1024 * 1024) { ok = false; break; }
+                ok = file_contains(idx.full_path(entry_idx), p.content_lc);
+                break;
+            }
         }
         if (p.negate) ok = !ok;
         if (!ok) return false;

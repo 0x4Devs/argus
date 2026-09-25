@@ -18,19 +18,21 @@ namespace argus {
 
 struct QueryPredicate {
     enum Kind {
-        NameContains  = 0,
-        Extension     = 1,   // ext:
-        TypeCategory  = 2,   // type:image, type:video, ...
-        PathContains  = 3,   // path:
-        SizeCompare   = 4,   // size:>100MB
-        ModifiedCmp   = 5,   // modified:<7d  (delta) or modified:>2026-01-01
-        CreatedCmp    = 6,   // future — not populated yet
+        NameContains    = 0,
+        Extension       = 1,   // ext:
+        TypeCategory    = 2,   // type:image, type:video, ...
+        PathContains    = 3,   // path:
+        SizeCompare     = 4,   // size:>100MB
+        ModifiedCmp     = 5,   // modified:<7d  (delta) or modified:>2026-01-01
+        CreatedCmp      = 6,   // future — not populated yet
+        ContentContains = 7,   // content:foo — search inside text files
     };
     enum Op { EQ = 0, LT = 1, LE = 2, GT = 3, GE = 4 };
 
     Kind         kind    = NameContains;
     bool         negate  = false;
     std::wstring text;               // for Name/Path/Ext/Type
+    std::string  content_lc;         // lowercase UTF-8 for ContentContains
     std::string  category;           // "image", "video", ...
     Op           op      = EQ;
     uint64_t     numeric = 0;        // size in bytes, or FILETIME 100ns ticks
